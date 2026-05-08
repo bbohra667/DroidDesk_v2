@@ -56,19 +56,57 @@ update_progress() {
 spinner() {
     local pid=$1
     local message=$2
-    local spin='-\|/'
+    local spin_chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    local bar_width=20
     local i=0
+    local start_time=$SECONDS
+    local cols
+    cols=$(tput cols 2>/dev/null || echo 80)
+
     while kill -0 $pid 2>/dev/null; do
-        i=$(( (i+1) % 4 ))
-        printf "\r  [*] ${message} ${CYAN}${spin:$i:1}${NC}  "
-        sleep 0.1
+        local elapsed=$((SECONDS - start_time))
+        local fill=$((elapsed % 60 * bar_width / 60))
+        local bar=""
+        local j
+        for ((j=0; j<bar_width; j++)); do
+            if [ $j -lt $fill ]; then bar+="█"
+            elif [ $j -eq $fill ]; then bar+="${spin_chars:$((i % 9)):1}"
+            else bar+="░"
+            fi
+        done
+
+        local mins=$((elapsed / 60))
+        local secs=$((elapsed % 60))
+        local timestr
+        if [ $mins -gt 0 ]; then
+            timestr=$(printf "%dm%ds" $mins $secs)
+        else
+            timestr=$(printf "%ds" $secs)
+        fi
+
+        local line
+        printf -v line "  [%s] %s  %s" "$bar" "$message" "$timestr"
+        printf "\r%-${cols}s" "$line"
+        i=$((i + 1))
+        sleep 0.15
     done
     wait $pid
     local exit_code=$?
-    if [ $exit_code -eq 0 ]; then
-        printf "\r  [+] ${message}                    \n"
+    local elapsed=$((SECONDS - start_time))
+    local mins=$((elapsed / 60))
+    local secs=$((elapsed % 60))
+    local timestr
+    if [ $mins -gt 0 ]; then
+        timestr=$(printf "%dm%ds" $mins $secs)
     else
-        printf "\r  [-] ${message} ${RED}(failed)${NC}     \n"
+        timestr=$(printf "%ds" $secs)
+    fi
+
+    printf "\r%-${cols}s\r" ""
+    if [ $exit_code -eq 0 ]; then
+        printf "  [+] %s (done in %s)\n" "$message" "$timestr"
+    else
+        printf "  [-] %s (failed after %s)\n" "$message" "$timestr"
     fi
     return $exit_code
 }
@@ -271,39 +309,100 @@ step_proot() {
     echo ""
     echo -e "${CYAN}Querying available distributions from proot-distro...${NC}"
 
-    # Parse proot-distro list output into parallel arrays
-    # Format: "  * Display Name < alias >"
+    # ---- Parse proot-distro list into parallel arrays ----
+    # Primary approach: parse "proot-distro list" output by matching lines
+    # with <alias> patterns. More lenient than requiring the * bullet format.
+    # If that fails, fall back to reading plugin files directly.
+    # Last resort: hardcoded list of all known distros.
     DISTRO_NAMES=()
     DISTRO_ALIASES=()
     DISTRO_PKGMGR=()
-    while IFS= read -r line; do
-        name=$(echo "$line" | sed 's/[[:space:]]*<.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-        alias=$(echo "$line" | sed 's/.*<[[:space:]]*//;s/[[:space:]]*>.*//')
-        # Skip termux (recursive proot doesn't make sense)
-        [ "$alias" = "termux" ] && continue
 
-        # Map alias to package manager (inline, no subshell)
-        case "$alias" in
-            ubuntu|debian|deepin|pardus|trisquel|openkylin)  pkg="apt" ;;
-            archlinux|artix|manjaro)                          pkg="pacman" ;;
-            fedora|almalinux|oracle|rockylinux)               pkg="dnf" ;;
-            alpine|adelie|chimera)                            pkg="apk" ;;
-            opensuse)                                         pkg="zypper" ;;
-            void)                                             pkg="xbps" ;;
-            *)                                                pkg="unknown" ;;
+    _parse_distro_line() {
+        # $1 = raw line from proot-distro list (may contain \r, leading *, etc.)
+        local raw="$1"
+        local line name alias pkg
+        line=$(echo "$raw" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        case "$line" in
+            *"<"*">"*)
+                name=$(echo "$line" | sed 's/[[:space:]]*<.*//' | sed 's/^[[:space:]]*\*[[:space:]]*//;s/[[:space:]]*$//')
+                alias=$(echo "$line" | sed 's/.*<[[:space:]]*//;s/[[:space:]]*>[[:space:]]*$//;s/>.*//')
+                [ -z "$alias" ] && return 1
+                [ "$alias" = "termux" ] && return 1
+                case "$alias" in
+                    ubuntu|debian|deepin|pardus|trisquel|openkylin) pkg="apt" ;;
+                    archlinux|artix|manjaro)                         pkg="pacman" ;;
+                    fedora|almalinux|oracle|rockylinux)              pkg="dnf" ;;
+                    alpine|adelie|chimera)                           pkg="apk" ;;
+                    opensuse)                                        pkg="zypper" ;;
+                    void)                                            pkg="xbps" ;;
+                    *)                                               pkg="unknown" ;;
+                esac
+                DISTRO_NAMES+=("$name")
+                DISTRO_ALIASES+=("$alias")
+                DISTRO_PKGMGR+=("$pkg")
+                ;;
         esac
+    }
 
-        DISTRO_NAMES+=("$name")
-        DISTRO_ALIASES+=("$alias")
-        DISTRO_PKGMGR+=("$pkg")
-    done < <(proot-distro list 2>/dev/null | sed -n 's/^[[:space:]]*\*[[:space:]]*//p')
+    # Attempt 1: parse proot-distro list output
+    while IFS= read -r raw; do
+        _parse_distro_line "$raw"
+    done < <(proot-distro list 2>/dev/null | grep '<')
 
+    # Attempt 2: if parsing failed, read plugin files directly
     if [ ${#DISTRO_NAMES[@]} -eq 0 ]; then
-        echo -e "  ${RED}[!] Failed to query proot-distro list — using fallback${NC}"
-        # Fallback: well-known distros that proot-distro has always supported
-        DISTRO_NAMES=("Ubuntu" "Debian" "Arch Linux" "Fedora" "Alpine Linux" "Void Linux" "OpenSUSE")
-        DISTRO_ALIASES=("ubuntu" "debian" "archlinux" "fedora" "alpine" "void" "opensuse")
-        DISTRO_PKGMGR=("apt" "apt" "pacman" "dnf" "apk" "xbps" "zypper")
+        PLUGIN_DIR="/data/data/com.termux/files/usr/share/proot-distro/plugins"
+        if [ -d "$PLUGIN_DIR" ]; then
+            for plugin in "$PLUGIN_DIR"/*.sh; do
+                [ -f "$plugin" ] || continue
+                local_alias=$(basename "$plugin" .sh)
+                [ "$local_alias" = "termux" ] && continue
+                local_name=$(grep '^DISTRO_NAME=' "$plugin" 2>/dev/null | head -1 | sed 's/^DISTRO_NAME="//;s/"$//')
+                [ -z "$local_name" ] && local_name="$local_alias"
+                case "$local_alias" in
+                    ubuntu|debian|deepin|pardus|trisquel|openkylin) local_pkg="apt" ;;
+                    archlinux|artix|manjaro)                         local_pkg="pacman" ;;
+                    fedora|almalinux|oracle|rockylinux)              local_pkg="dnf" ;;
+                    alpine|adelie|chimera)                           local_pkg="apk" ;;
+                    opensuse)                                        local_pkg="zypper" ;;
+                    void)                                            local_pkg="xbps" ;;
+                    *)                                               local_pkg="unknown" ;;
+                esac
+                DISTRO_NAMES+=("$local_name")
+                DISTRO_ALIASES+=("$local_alias")
+                DISTRO_PKGMGR+=("$local_pkg")
+            done
+        fi
+    fi
+
+    # Attempt 3: hardcoded fallback — all distros known to proot-distro (minus termux)
+    if [ ${#DISTRO_NAMES[@]} -eq 0 ]; then
+        echo -e "  ${YELLOW}[!] Could not query proot-distro — using built-in list${NC}"
+        DISTRO_NAMES=(
+            "Adélie Linux"       "AlmaLinux"           "Alpine Linux"
+            "Arch Linux"         "Artix Linux"         "Chimera Linux"
+            "Debian (trixie)"    "Deepin"              "Fedora"
+            "Manjaro"            "OpenSUSE"            "Oracle Linux"
+            "Pardus"             "Rocky Linux"         "Trisquel GNU/Linux"
+            "Ubuntu (25.10)"     "Void Linux"
+        )
+        DISTRO_ALIASES=(
+            "adelie"   "almalinux"  "alpine"
+            "archlinux" "artix"     "chimera"
+            "debian"    "deepin"    "fedora"
+            "manjaro"   "opensuse"  "oracle"
+            "pardus"    "rockylinux" "trisquel"
+            "ubuntu"    "void"
+        )
+        DISTRO_PKGMGR=(
+            "apk"    "dnf"     "apk"
+            "pacman" "pacman"  "apk"
+            "apt"    "apt"     "dnf"
+            "pacman" "zypper"  "dnf"
+            "apt"    "dnf"     "apt"
+            "apt"    "xbps"
+        )
     fi
 
     TOTAL_DISTROS=${#DISTRO_NAMES[@]}
@@ -682,9 +781,25 @@ PROOTEOF
 #         Blender libvulkan auto-detect, LibreOffice --norestore
 # ============================================================
 
-PROOT_DISTRO="${1:-ubuntu}"
+PROOT_DISTRO="${1:-}"
+PROOT_ROOT="/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs"
+
+# Auto-detect installed proot distro if no argument given
+if [ -z "$PROOT_DISTRO" ]; then
+    for d in "$PROOT_ROOT"/*; do
+        [ -d "$d" ] || continue
+        PROOT_DISTRO=$(basename "$d")
+        break
+    done
+    if [ -z "$PROOT_DISTRO" ]; then
+        echo "[!] No proot distro found. Run the setup script first."
+        exit 1
+    fi
+    echo "[*] Auto-detected proot distro: $PROOT_DISTRO"
+fi
+
 PROOT_BIN="/data/data/com.termux/files/usr/bin/proot-distro"
-PROOT_ROOTFS="/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs/$PROOT_DISTRO"
+PROOT_ROOTFS="$PROOT_ROOT/$PROOT_DISTRO"
 PROOT_APPS="$PROOT_ROOTFS/usr/share/applications"
 BRIDGE_DIR="$HOME/.local/share/applications/proot-bridge"
 WRAPPER_DIR="$HOME/.local/share/proot-wrappers"
@@ -961,7 +1076,7 @@ sleep 3
 export DISPLAY=:0
 
 # Sync proot apps into menu (background, non-blocking)
-[ -f ~/proot-menu-sync.sh ] && bash ~/proot-menu-sync.sh &
+[ -f ~/proot-menu-sync.sh ] && bash ~/proot-menu-sync.sh "$PROOT_DISTRO" &
 
 echo "----------------------------------------------"
 echo "  [*] Open the Termux-X11 app to see desktop"
