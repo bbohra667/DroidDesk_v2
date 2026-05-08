@@ -221,7 +221,12 @@ step_gpu() {
     if [ "$GPU_DRIVER" == "freedreno" ]; then
         install_pkg "mesa-vulkan-icd-freedreno" "Turnip Adreno Driver"
     fi
-    install_pkg "vulkan-loader-android" "Vulkan Loader"
+    # vulkan-loader is usually pulled in as a mesa dependency; non-fatal if already satisfied
+    (DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+        -o Dpkg::Options::="--force-confold" vulkan-loader-android > /dev/null 2>&1) &
+    spinner $! "Installing Vulkan Loader..." || {
+        echo -e "  [!] Vulkan Loader skipped (already provided by mesa packages)"
+    }
 }
 
 # ============== STEP 6: AUDIO ==============
@@ -270,47 +275,52 @@ step_proot() {
     # Format: "  * Display Name < alias >"
     DISTRO_NAMES=()
     DISTRO_ALIASES=()
+    DISTRO_PKGMGR=()
     while IFS= read -r line; do
         name=$(echo "$line" | sed 's/[[:space:]]*<.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         alias=$(echo "$line" | sed 's/.*<[[:space:]]*//;s/[[:space:]]*>.*//')
         # Skip termux (recursive proot doesn't make sense)
         [ "$alias" = "termux" ] && continue
+
+        # Map alias to package manager (inline, no subshell)
+        case "$alias" in
+            ubuntu|debian|deepin|pardus|trisquel|openkylin)  pkg="apt" ;;
+            archlinux|artix|manjaro)                          pkg="pacman" ;;
+            fedora|almalinux|oracle|rockylinux)               pkg="dnf" ;;
+            alpine|adelie|chimera)                            pkg="apk" ;;
+            opensuse)                                         pkg="zypper" ;;
+            void)                                             pkg="xbps" ;;
+            *)                                                pkg="unknown" ;;
+        esac
+
         DISTRO_NAMES+=("$name")
         DISTRO_ALIASES+=("$alias")
+        DISTRO_PKGMGR+=("$pkg")
     done < <(proot-distro list 2>/dev/null | sed -n 's/^[[:space:]]*\*[[:space:]]*//p')
 
     if [ ${#DISTRO_NAMES[@]} -eq 0 ]; then
-        echo -e "  ${RED}[!] Failed to query proot-distro list${NC}"
-        return 1
+        echo -e "  ${RED}[!] Failed to query proot-distro list — using fallback${NC}"
+        # Fallback: well-known distros that proot-distro has always supported
+        DISTRO_NAMES=("Ubuntu" "Debian" "Arch Linux" "Fedora" "Alpine Linux" "Void Linux" "OpenSUSE")
+        DISTRO_ALIASES=("ubuntu" "debian" "archlinux" "fedora" "alpine" "void" "opensuse")
+        DISTRO_PKGMGR=("apt" "apt" "pacman" "dnf" "apk" "xbps" "zypper")
     fi
 
     TOTAL_DISTROS=${#DISTRO_NAMES[@]}
 
-    # Helper: map alias to package manager
-    _pkg_mgr_for() {
-        case "$1" in
-            ubuntu|debian|deepin|pardus|trisquel|openkylin)  echo "apt" ;;
-            archlinux|artix|manjaro)                echo "pacman" ;;
-            fedora|almalinux|oracle|rockylinux)     echo "dnf" ;;
-            alpine|adelie|chimera)                  echo "apk" ;;
-            opensuse)                               echo "zypper" ;;
-            void)                                   echo "xbps" ;;
-            *)                                      echo "unknown" ;;
+    # Precompute group labels to avoid subshell calls in the display loop
+    DISTRO_GROUPS=()
+    for pkg in "${DISTRO_PKGMGR[@]}"; do
+        case "$pkg" in
+            apt)    DISTRO_GROUPS+=("Debian-based") ;;
+            pacman) DISTRO_GROUPS+=("Arch-based") ;;
+            dnf)    DISTRO_GROUPS+=("RHEL/Fedora-based") ;;
+            apk)    DISTRO_GROUPS+=("Alpine-based") ;;
+            zypper) DISTRO_GROUPS+=("SUSE-based") ;;
+            xbps)   DISTRO_GROUPS+=("Void-based") ;;
+            *)      DISTRO_GROUPS+=("Other") ;;
         esac
-    }
-
-    # Helper: group label for package manager
-    _group_label() {
-        case "$1" in
-            apt)    echo "Debian-based" ;;
-            pacman) echo "Arch-based" ;;
-            dnf)    echo "RHEL/Fedora-based" ;;
-            apk)    echo "Alpine-based" ;;
-            zypper) echo "SUSE-based" ;;
-            xbps)   echo "Void-based" ;;
-            *)      echo "Other" ;;
-        esac
-    }
+    done
 
     echo ""
     echo -e "${CYAN}Choose a Linux distro for Proot:${NC}"
@@ -319,8 +329,7 @@ step_proot() {
     # Display grouped by package manager
     CURRENT_GROUP=""
     for i in "${!DISTRO_NAMES[@]}"; do
-        pkg=$(_pkg_mgr_for "${DISTRO_ALIASES[$i]}")
-        grp=$(_group_label "$pkg")
+        grp="${DISTRO_GROUPS[$i]}"
         if [ "$grp" != "$CURRENT_GROUP" ]; then
             CURRENT_GROUP="$grp"
             echo -e "  ${WHITE}${grp}:${NC}"
@@ -344,11 +353,15 @@ step_proot() {
     IDX=$((PROOT_INPUT - 1))
     PROOT_DISTRO="${DISTRO_ALIASES[$IDX]}"
     PROOT_LABEL="${DISTRO_NAMES[$IDX]}"
-    PKG_MGR=$(_pkg_mgr_for "$PROOT_DISTRO")
+    PKG_MGR="${DISTRO_PKGMGR[$IDX]}"
 
     echo -e "\n${GREEN}[+] Installing ${PROOT_LABEL} (${PROOT_DISTRO})...${NC}"
     (proot-distro install "$PROOT_DISTRO" > /dev/null 2>&1) &
     spinner $! "Downloading ${PROOT_LABEL} rootfs (may take a while)..."
+    if [ $? -ne 0 ]; then
+        echo -e "  ${RED}[!] Failed to install ${PROOT_DISTRO} rootfs — skipping proot setup${NC}"
+        return 1
+    fi
 
     # Detect actual distro version from /etc/os-release inside the installed rootfs
     DETECTED_SHELL="bash"
@@ -695,8 +708,9 @@ mkdir -p "$BRIDGE_DIR" "$WRAPPER_DIR"
 HAS_GPU="software"
 [ -d "/dev/dri" ] && HAS_GPU="zink"
 
-# Auto-detect package manager inside the proot container
-_PKG_MGR=$("$PROOT_BIN" login "$PROOT_DISTRO" -- bash -c '
+# Auto-detect package manager inside the proot container (use /bin/sh since
+# some distros don't ship bash by default; we install it during bootstrap)
+_PKG_MGR=$("$PROOT_BIN" login "$PROOT_DISTRO" -- /bin/sh -c '
     if command -v apt-get >/dev/null 2>&1; then echo apt;
     elif command -v pacman >/dev/null 2>&1; then echo pacman;
     elif command -v dnf >/dev/null 2>&1; then echo dnf;
