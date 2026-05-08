@@ -492,9 +492,6 @@ step_proot() {
                     --recv-keys 3B4FE6ACC0B21F32 871920D1991BC93C 2>/dev/null || true
                 apt-get update -y -q 2>/tmp/proot-setup.log || true
                 apt-get install -y -q --no-install-recommends \
-                    mesa-utils vulkan-tools \
-                    libgl1-mesa-glx libvulkan1 libgles2-mesa \
-                    xfce4 xfce4-terminal dbus-x11 \
                     sudo curl wget git htop nano 2>/tmp/proot-setup.log
             "
             ;;
@@ -502,8 +499,6 @@ step_proot() {
             proot-distro login "$PROOT_DISTRO" -- bash -c "
                 pacman -Sy --noconfirm 2>/tmp/proot-setup.log || true
                 pacman -S --noconfirm --needed \
-                    mesa-utils vulkan-tools mesa \
-                    xfce4 xfce4-terminal dbus \
                     sudo curl wget git htop nano 2>/tmp/proot-setup.log
             "
             ;;
@@ -511,9 +506,6 @@ step_proot() {
             proot-distro login "$PROOT_DISTRO" -- bash -c "
                 dnf check-update -y 2>/tmp/proot-setup.log || true
                 dnf install -y \
-                    mesa-demos vulkan-tools \
-                    mesa-libGL vulkan-loader mesa-libGLES \
-                    @xfce-desktop-environment xfce4-terminal dbus-x11 \
                     sudo curl wget git htop nano 2>/tmp/proot-setup.log
             "
             ;;
@@ -521,9 +513,6 @@ step_proot() {
             proot-distro login "$PROOT_DISTRO" -- /bin/sh -c "
                 apk update 2>/tmp/proot-setup.log || true
                 apk add \
-                    mesa-utils vulkan-tools \
-                    mesa-gl vulkan-loader mesa-gles \
-                    xfce4 xfce4-terminal dbus-x11 \
                     sudo curl wget git htop nano bash 2>/tmp/proot-setup.log
             "
             ;;
@@ -531,9 +520,6 @@ step_proot() {
             proot-distro login "$PROOT_DISTRO" -- bash -c "
                 zypper refresh 2>/tmp/proot-setup.log || true
                 zypper install -y \
-                    Mesa-demo-x vulkan-tools \
-                    Mesa-libGL1 libvulkan1 Mesa-libGLESv2-2 \
-                    xfce4 xfce4-terminal dbus-1-x11 \
                     sudo curl wget git htop nano 2>/tmp/proot-setup.log
             "
             ;;
@@ -541,8 +527,6 @@ step_proot() {
             proot-distro login "$PROOT_DISTRO" -- /bin/sh -c "
                 xbps-install -Sy 2>/tmp/proot-setup.log || true
                 xbps-install -y \
-                    mesa-demos vulkan-tools mesa vulkan-loader \
-                    xfce4 xfce4-terminal dbus-x11 \
                     sudo curl wget git htop nano 2>/tmp/proot-setup.log
             "
             ;;
@@ -992,6 +976,121 @@ SYNCEOF
 
     # Run once during install
     bash ~/proot-menu-sync.sh "$PROOT_DISTRO" 2>/dev/null || true
+
+    # ---- proot-gpu-setup.sh (for installing GPU drivers inside the proot container) ----
+    cat > ~/proot-gpu-setup.sh << 'GPUEOF'
+#!/data/data/com.termux/files/usr/bin/bash
+# ============================================================
+#  Proot GPU Setup
+#  Installs Mesa + Vulkan drivers inside the proot container.
+#  Auto-detects GPU type (freedreno/Adreno vs zink/others)
+#  and the container's package manager.
+# ============================================================
+
+PROOT_DISTRO="${1:-}"
+PROOT_ROOT="/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs"
+
+# Auto-detect installed proot distro if no argument given
+if [ -z "$PROOT_DISTRO" ]; then
+    for d in "$PROOT_ROOT"/*; do
+        [ -d "$d" ] || continue
+        PROOT_DISTRO=$(basename "$d")
+        break
+    done
+    if [ -z "$PROOT_DISTRO" ]; then
+        echo "[!] No proot distro found. Install one with proot-distro first."
+        exit 1
+    fi
+    echo "[*] Auto-detected proot distro: $PROOT_DISTRO"
+fi
+
+PROOT_BIN="/data/data/com.termux/files/usr/bin/proot-distro"
+PROOT_ROOTFS="$PROOT_ROOT/$PROOT_DISTRO"
+
+if [ ! -d "$PROOT_ROOTFS" ]; then
+    echo "[!] Proot distro '$PROOT_DISTRO' not installed."
+    exit 1
+fi
+
+# Detect GPU type: freedreno for Adreno, zink for everything else
+GPU_TYPE="zink"
+if [ -e "/sys/class/kgsl/kgsl-3d0" ] || \
+   ls /sys/devices/platform/*.gpu 2>/dev/null | grep -q . || \
+   (command -v getprop >/dev/null 2>&1 && getprop ro.hardware 2>/dev/null | grep -qi "qcom\|adreno"); then
+    GPU_TYPE="freedreno"
+fi
+
+# Detect package manager inside proot
+_PKG_MGR=$("$PROOT_BIN" login "$PROOT_DISTRO" -- /bin/sh -c '
+    if command -v apt-get >/dev/null 2>&1; then echo apt;
+    elif command -v pacman >/dev/null 2>&1; then echo pacman;
+    elif command -v dnf >/dev/null 2>&1; then echo dnf;
+    elif command -v apk >/dev/null 2>&1; then echo apk;
+    elif command -v zypper >/dev/null 2>&1; then echo zypper;
+    elif command -v xbps-install >/dev/null 2>&1; then echo xbps;
+    fi' 2>/dev/null)
+
+if [ -z "$_PKG_MGR" ]; then
+    echo "[!] Could not detect package manager inside proot."
+    exit 1
+fi
+
+echo "[*] Detected GPU: $GPU_TYPE"
+echo "[*] Package manager: $_PKG_MGR"
+
+case "$_PKG_MGR" in
+    apt)
+        "$PROOT_BIN" login "$PROOT_DISTRO" -- bash -c "
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -y -q 2>/dev/null || true
+            apt-get install -y -q --no-install-recommends \
+                mesa mesa-vulkan-drivers vulkan-loader 2>/tmp/proot-gpu.log
+        "
+        ;;
+    pacman)
+        "$PROOT_BIN" login "$PROOT_DISTRO" -- bash -c "
+            pacman -Sy --noconfirm 2>/dev/null || true
+            pacman -S --noconfirm --needed \
+                mesa vulkan-icd-loader 2>/tmp/proot-gpu.log
+        "
+        ;;
+    dnf)
+        "$PROOT_BIN" login "$PROOT_DISTRO" -- bash -c "
+            dnf check-update -y 2>/dev/null || true
+            dnf install -y \
+                mesa mesa-vulkan-drivers vulkan-loader 2>/tmp/proot-gpu.log
+        "
+        ;;
+    apk)
+        "$PROOT_BIN" login "$PROOT_DISTRO" -- /bin/sh -c "
+            apk update 2>/dev/null || true
+            apk add mesa mesa-vulkan-icd-freedreno vulkan-loader 2>/tmp/proot-gpu.log
+        "
+        ;;
+    zypper)
+        "$PROOT_BIN" login "$PROOT_DISTRO" -- bash -c "
+            zypper refresh 2>/dev/null || true
+            zypper install -y Mesa Mesa-vulkan-drivers libvulkan1 2>/tmp/proot-gpu.log
+        "
+        ;;
+    xbps)
+        "$PROOT_BIN" login "$PROOT_DISTRO" -- /bin/sh -c "
+            xbps-install -Sy 2>/dev/null || true
+            xbps-install -y mesa mesa-vulkan-icd-freedreno vulkan-loader 2>/tmp/proot-gpu.log
+        "
+        ;;
+esac
+
+if [ $? -eq 0 ]; then
+    echo "[+] GPU drivers installed successfully in proot ($GPU_TYPE via $_PKG_MGR)"
+    echo "    Check /tmp/proot-gpu.log inside proot for details"
+else
+    echo "[-] GPU driver install exited with errors (see /tmp/proot-gpu.log)"
+fi
+GPUEOF
+    chmod +x ~/proot-gpu-setup.sh
+    echo -e "  [+] Created ~/proot-gpu-setup.sh"
+    bash ~/proot-gpu-setup.sh "$PROOT_DISTRO" 2>/dev/null || true
 }
 
 # ============== STEP 10: LAUNCHERS ==============
