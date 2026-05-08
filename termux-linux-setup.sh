@@ -410,8 +410,9 @@ step_proot() {
         local raw="$1"
         local line name alias pkg
         line=$(echo "$raw" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        # Only parse lines starting with * (bullet) and containing <alias>
         case "$line" in
-            *"<"*">"*)
+            \**"<"*">"*)
                 name=$(echo "$line" | sed 's/[[:space:]]*<.*//' | sed 's/^[[:space:]]*\*[[:space:]]*//;s/[[:space:]]*$//')
                 alias=$(echo "$line" | sed 's/.*<[[:space:]]*//;s/[[:space:]]*>[[:space:]]*$//;s/>.*//')
                 [ -z "$alias" ] && return 1
@@ -467,30 +468,59 @@ step_proot() {
     if [ ${#DISTRO_NAMES[@]} -eq 0 ]; then
         echo -e "  ${YELLOW}[!] Could not query proot-distro — using built-in list${NC}"
         DISTRO_NAMES=(
-            "Adélie Linux"       "AlmaLinux"           "Alpine Linux"
-            "Arch Linux"         "Artix Linux"         "Chimera Linux"
-            "Debian (trixie)"    "Deepin"              "Fedora"
-            "Manjaro"            "OpenSUSE"            "Oracle Linux"
-            "Pardus"             "Rocky Linux"         "Trisquel GNU/Linux"
-            "Ubuntu (25.10)"     "Void Linux"
+            "Alpine Linux"      "Adélie Linux"       "Chimera Linux"
+            "Arch Linux"        "Artix Linux"        "Manjaro"
+            "Debian (trixie)"   "Deepin"             "Pardus"
+            "Trisquel GNU/Linux" "Ubuntu (25.10)"
+            "AlmaLinux"         "Fedora"             "Oracle Linux"
+            "Rocky Linux"
+            "OpenSUSE"
+            "Void Linux"
         )
         DISTRO_ALIASES=(
-            "adelie"   "almalinux"  "alpine"
-            "archlinux" "artix"     "chimera"
-            "debian"    "deepin"    "fedora"
-            "manjaro"   "opensuse"  "oracle"
-            "pardus"    "rockylinux" "trisquel"
-            "ubuntu"    "void"
+            "alpine"     "adelie"      "chimera"
+            "archlinux"  "artix"       "manjaro"
+            "debian"     "deepin"      "pardus"
+            "trisquel"   "ubuntu"
+            "almalinux"  "fedora"      "oracle"
+            "rockylinux"
+            "opensuse"
+            "void"
         )
         DISTRO_PKGMGR=(
-            "apk"    "dnf"     "apk"
-            "pacman" "pacman"  "apk"
-            "apt"    "apt"     "dnf"
-            "pacman" "zypper"  "dnf"
-            "apt"    "dnf"     "apt"
-            "apt"    "xbps"
+            "apk"    "apk"     "apk"
+            "pacman" "pacman"  "pacman"
+            "apt"    "apt"     "apt"
+            "apt"    "apt"
+            "dnf"    "dnf"     "dnf"
+            "dnf"
+            "zypper"
+            "xbps"
         )
     fi
+
+    # Reorder all entries by package manager group so display headers are contiguous
+    _reorder_by_group() {
+        local pkg_order=("apt" "pacman" "dnf" "apk" "zypper" "xbps")
+        local sorted_indices=()
+        for pkg in "${pkg_order[@]}"; do
+            for i in "${!DISTRO_NAMES[@]}"; do
+                if [ "${DISTRO_PKGMGR[$i]}" = "$pkg" ]; then
+                    sorted_indices+=("$i")
+                fi
+            done
+        done
+        local new_names=() new_aliases=() new_pkgmgr=()
+        for idx in "${sorted_indices[@]}"; do
+            new_names+=("${DISTRO_NAMES[$idx]}")
+            new_aliases+=("${DISTRO_ALIASES[$idx]}")
+            new_pkgmgr+=("${DISTRO_PKGMGR[$idx]}")
+        done
+        DISTRO_NAMES=("${new_names[@]}")
+        DISTRO_ALIASES=("${new_aliases[@]}")
+        DISTRO_PKGMGR=("${new_pkgmgr[@]}")
+    }
+    _reorder_by_group
 
     TOTAL_DISTROS=${#DISTRO_NAMES[@]}
 
