@@ -324,49 +324,71 @@ step_proot() {
     # Uses deb822 (.sources) format with Signed-By for reliable GPG keyring
     # instead of deprecated apt-key.
     if [ "$PROOT_DISTRO" = "ubuntu" ]; then
-        proot-distro login "$PROOT_DISTRO" -- bash -c "
-            # Skip if already configured
-            [ -f /etc/apt/sources.list.d/debian.sources ] && exit 0
+        proot-distro login "$PROOT_DISTRO" -- bash -c '
+            # Skip if already configured AND keyring is valid
+            if [ -f /etc/apt/sources.list.d/debian.sources ] && \
+               [ -s /usr/share/keyrings/debian-archive-keyring.gpg ]; then
+                exit 0
+            fi
 
-            # Ensure gnupg is available for key import
-            apt-get install -y -q gnupg ca-certificates curl \
-                2>/tmp/proot-debian-repo.log || true
+            # Clean up any partial state from a previous failed attempt
+            rm -f /etc/apt/sources.list.d/debian*
+            rm -f /etc/apt/preferences.d/debian-bookworm
+
+            # Install gnupg — fail hard if this does not work
+            apt-get install -y -q gnupg ca-certificates curl || {
+                echo "  [!] Failed to install gnupg/ca-certificates/curl" >&2
+                exit 1
+            }
 
             # Download and install the official Debian 12 archive keyring
             mkdir -p /usr/share/keyrings
-            curl -fsSL https://ftp-master.debian.org/keys/archive-key-12.asc \
-                -o /tmp/debian12.asc 2>/dev/null
-            gpg --dearmor -o /usr/share/keyrings/debian-archive-keyring.gpg \
-                /tmp/debian12.asc 2>/dev/null
+            if ! curl -fsSL https://ftp-master.debian.org/keys/archive-key-12.asc \
+                -o /tmp/debian12.asc; then
+                echo "  [!] Failed to download Debian 12 archive key" >&2
+                exit 1
+            fi
+            if ! gpg --dearmor -o /usr/share/keyrings/debian-archive-keyring.gpg \
+                /tmp/debian12.asc; then
+                echo "  [!] Failed to dearmor Debian 12 archive key" >&2
+                rm -f /tmp/debian12.asc
+                exit 1
+            fi
             rm -f /tmp/debian12.asc
 
-            # Remove any old-style debian list files to avoid conflicts
-            rm -f /etc/apt/sources.list.d/debian*
+            # Verify the keyring file is non-empty
+            if [ ! -s /usr/share/keyrings/debian-archive-keyring.gpg ]; then
+                echo "  [!] Debian keyring is empty after dearmor" >&2
+                exit 1
+            fi
 
             # Write modern deb822-format sources entry with Signed-By
-            printf '%s\n' \
-                'Types: deb' \
-                'URIs: http://deb.debian.org/debian' \
-                'Suites: bookworm' \
-                'Components: main' \
-                'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
+            printf "%s\n" \
+                "Types: deb" \
+                "URIs: http://deb.debian.org/debian" \
+                "Suites: bookworm" \
+                "Components: main" \
+                "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg" \
                 > /etc/apt/sources.list.d/debian.sources
 
             # Pin Debian at normal priority (500). Pin Ubuntu low so Debian wins
             # on any package that exists in both repos. This avoids snapd deps.
-            printf '%s\n' \
-                'Package: *' \
-                'Pin: release o=Debian' \
-                'Pin-Priority: 500' \
-                '' \
-                'Package: *' \
-                'Pin: release o=Ubuntu' \
-                'Pin-Priority: 99' \
+            printf "%s\n" \
+                "Package: *" \
+                "Pin: release o=Debian" \
+                "Pin-Priority: 500" \
+                "" \
+                "Package: *" \
+                "Pin: release o=Ubuntu" \
+                "Pin-Priority: 99" \
                 > /etc/apt/preferences.d/debian-bookworm
 
-            apt-get update -y -q 2>/dev/null || true
-            echo '  [+] Debian Bookworm repo added as default (avoids snap-only Ubuntu packages)'
-        " 2>/dev/null
+            apt-get update -y -q || {
+                echo "  [!] apt-get update failed after adding Debian repo" >&2
+                exit 1
+            }
+            echo "  [+] Debian Bookworm repo added as default (avoids snap-only Ubuntu packages)"
+        '
     fi
 
     # ---- Global --no-sandbox wrapper for Electron/Chromium apps in proot ----
