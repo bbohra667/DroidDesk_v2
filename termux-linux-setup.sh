@@ -57,7 +57,7 @@ spinner() {
     local pid=$1
     local message=$2
     local spin_chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-    local bar_width=20
+    local bar_width=12
     local i=0
     local start_time=$SECONDS
     local cols
@@ -85,7 +85,7 @@ spinner() {
         fi
 
         local line
-        printf -v line "  [%s] %s  %s" "$bar" "$message" "$timestr"
+        printf -v line "  [+] [%s] %s  %s" "$bar" "$message" "$timestr"
         printf "\r%-${cols}s" "$line"
         i=$((i + 1))
         sleep 0.15
@@ -93,30 +93,117 @@ spinner() {
     wait $pid
     local exit_code=$?
     local elapsed=$((SECONDS - start_time))
-    local mins=$((elapsed / 60))
-    local secs=$((elapsed % 60))
-    local timestr
-    if [ $mins -gt 0 ]; then
-        timestr=$(printf "%dm%ds" $mins $secs)
-    else
-        timestr=$(printf "%ds" $secs)
-    fi
 
     printf "\r%-${cols}s\r" ""
     if [ $exit_code -eq 0 ]; then
-        printf "  [+] %s (done in %s)\n" "$message" "$timestr"
+        printf "  [+] %s (done in %ds)\n" "$message" "$elapsed"
     else
-        printf "  [-] %s (failed after %s)\n" "$message" "$timestr"
+        printf "  [-] %s (failed after %ds)\n" "$message" "$elapsed"
     fi
     return $exit_code
+}
+
+# Format bytes to human-readable (e.g., 12345678 → "11.7 MiB")
+_format_bytes() {
+    local bytes=$1
+    if [ "$bytes" -ge 1048576 ]; then
+        local int=$((bytes / 1048576))
+        local frac=$(((bytes % 1048576) * 10 / 1048576))
+        printf "%d.%d MiB" "$int" "$frac"
+    elif [ "$bytes" -ge 1024 ]; then
+        local int=$((bytes / 1024))
+        local frac=$(((bytes % 1024) * 10 / 1024))
+        printf "%d.%d KiB" "$int" "$frac"
+    else
+        printf "%d B" "$bytes"
+    fi
 }
 
 install_pkg() {
     local pkg=$1
     local name=${2:-$pkg}
-    (DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        -o Dpkg::Options::="--force-confold" $pkg > /dev/null 2>&1) &
-    spinner $! "Installing ${name}..."
+    local bar_width=6
+    local spin_chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    local cols
+    cols=$(tput cols 2>/dev/null || echo 80)
+    local i=0
+    local pkg_display="$name"
+    local bytes_total=0 bytes_curr=0 cps=0 eta=0
+    local _exit_code=0
+
+    while IFS= read -r line; do
+        case "$line" in
+            STATUS_DONE:*)
+                _exit_code="${line#STATUS_DONE:}"
+                break
+                ;;
+            dlstatus:*)
+                local rest="${line#dlstatus:}"
+                local dl_id dl_files dl_curr dl_total dl_cps dl_eta
+                IFS=: read -r dl_id dl_files dl_curr dl_total dl_cps dl_eta <<< "$rest"
+
+                [[ "$dl_curr" =~ ^[0-9]+$ ]] || dl_curr=0
+                [[ "$dl_total" =~ ^[0-9]+$ ]] || dl_total=0
+                [[ "$dl_cps" =~ ^[0-9]+$ ]] || dl_cps=0
+                [[ "$dl_eta" =~ ^[0-9]+$ ]] || dl_eta=0
+
+                bytes_curr=$dl_curr
+                bytes_total=$dl_total
+                cps=$dl_cps
+                eta=$dl_eta
+                ;;
+            pmstatus:*)
+                local rest="${line#pmstatus:}"
+                local pm_pkg pm_pct pm_mode pm_msg
+                IFS=: read -r pm_pkg pm_pct pm_mode pm_msg <<< "$rest"
+                [ -n "$pm_pkg" ] && pkg_display="$pm_pkg"
+                ;;
+        esac
+
+        local pct=0
+        [ "$bytes_total" -gt 0 ] && pct=$((bytes_curr * 100 / bytes_total))
+        [ "$pct" -gt 100 ] && pct=100
+
+        local fill=$((pct * bar_width / 100))
+        local bar=""
+        local j
+        for ((j=0; j<bar_width; j++)); do
+            if [ $j -lt $fill ]; then bar+="█"
+            elif [ $j -eq $fill ]; then bar+="${spin_chars:$((i % 9)):1}"
+            else bar+="░"
+            fi
+        done
+        i=$((i + 1))
+
+        local size_str="$(_format_bytes "$bytes_total")"
+        local speed_str="$(_format_bytes "$cps")/s"
+        local eta_str="--:--"
+        if [ "$eta" -gt 0 ] 2>/dev/null; then
+            local em=$((eta / 60))
+            local es=$((eta % 60))
+            eta_str=$(printf "%02d:%02d" "$em" "$es")
+        fi
+
+        local tpkg="${pkg_display:0:20}"
+        local display
+        printf -v display "  [+] [%s] %-20s %8s %9s %s" \
+            "$bar" "$tpkg" "$size_str" "$speed_str" "$eta_str"
+        printf "\r%-${cols}s" "$display"
+    done < <(
+        DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            -o APT::Status-Fd=4 \
+            -o Dpkg::Options::="--force-confold" $pkg \
+            4>&1 >/dev/null 2>&1
+        echo "STATUS_DONE:$?"
+    )
+
+    printf "\r%-${cols}s\r" ""
+    if [ "$_exit_code" = "0" ]; then
+        echo "  [+] $name installed"
+    else
+        echo "  [-] $name failed"
+    fi
+    return "$_exit_code"
 }
 
 # ============== BANNER ==============
