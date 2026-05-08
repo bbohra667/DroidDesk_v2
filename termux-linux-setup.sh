@@ -264,50 +264,183 @@ step_proot() {
     install_pkg "proot" "PRoot"
 
     echo ""
-    echo -e "${CYAN}Choose a Linux distro for Proot:${NC}"
-    echo -e "  ${WHITE}1) Ubuntu 22.04 LTS${NC}  (Recommended)"
-    echo -e "  ${WHITE}2) Debian 12${NC}          (Minimal)"
-    echo -e "  ${WHITE}3) Kali Linux${NC}         (Security/Pentesting)"
+    echo -e "${CYAN}Querying available distributions from proot-distro...${NC}"
+
+    # Parse proot-distro list output into parallel arrays
+    # Format: "  * Display Name < alias >"
+    DISTRO_NAMES=()
+    DISTRO_ALIASES=()
+    while IFS= read -r line; do
+        name=$(echo "$line" | sed 's/[[:space:]]*<.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        alias=$(echo "$line" | sed 's/.*<[[:space:]]*//;s/[[:space:]]*>.*//')
+        # Skip termux (recursive proot doesn't make sense)
+        [ "$alias" = "termux" ] && continue
+        DISTRO_NAMES+=("$name")
+        DISTRO_ALIASES+=("$alias")
+    done < <(proot-distro list 2>/dev/null | sed -n 's/^[[:space:]]*\*[[:space:]]*//p')
+
+    if [ ${#DISTRO_NAMES[@]} -eq 0 ]; then
+        echo -e "  ${RED}[!] Failed to query proot-distro list${NC}"
+        return 1
+    fi
+
+    TOTAL_DISTROS=${#DISTRO_NAMES[@]}
+
+    # Helper: map alias to package manager
+    _pkg_mgr_for() {
+        case "$1" in
+            ubuntu|debian|deepin|pardus|trisquel|openkylin)  echo "apt" ;;
+            archlinux|artix|manjaro)                echo "pacman" ;;
+            fedora|almalinux|oracle|rockylinux)     echo "dnf" ;;
+            alpine|adelie|chimera)                  echo "apk" ;;
+            opensuse)                               echo "zypper" ;;
+            void)                                   echo "xbps" ;;
+            *)                                      echo "unknown" ;;
+        esac
+    }
+
+    # Helper: group label for package manager
+    _group_label() {
+        case "$1" in
+            apt)    echo "Debian-based" ;;
+            pacman) echo "Arch-based" ;;
+            dnf)    echo "RHEL/Fedora-based" ;;
+            apk)    echo "Alpine-based" ;;
+            zypper) echo "SUSE-based" ;;
+            xbps)   echo "Void-based" ;;
+            *)      echo "Other" ;;
+        esac
+    }
+
     echo ""
-    while true; do
-        read -p "Enter number (1-3) [default: 1]: " PROOT_INPUT
-        PROOT_INPUT=${PROOT_INPUT:-1}
-        if [[ "$PROOT_INPUT" =~ ^[1-3]$ ]]; then break; fi
-        echo "Please enter 1, 2, or 3."
+    echo -e "${CYAN}Choose a Linux distro for Proot:${NC}"
+    echo ""
+
+    # Display grouped by package manager
+    CURRENT_GROUP=""
+    for i in "${!DISTRO_NAMES[@]}"; do
+        pkg=$(_pkg_mgr_for "${DISTRO_ALIASES[$i]}")
+        grp=$(_group_label "$pkg")
+        if [ "$grp" != "$CURRENT_GROUP" ]; then
+            CURRENT_GROUP="$grp"
+            echo -e "  ${WHITE}${grp}:${NC}"
+        fi
+        num=$((i + 1))
+        printf "    ${GREEN}%2d)${NC} %s\n" "$num" "${DISTRO_NAMES[$i]}"
     done
 
-    case $PROOT_INPUT in
-        1) PROOT_DISTRO="ubuntu";         PROOT_LABEL="Ubuntu 22.04";;
-        2) PROOT_DISTRO="debian";         PROOT_LABEL="Debian 12";;
-        3) PROOT_DISTRO="kali-nethunter"; PROOT_LABEL="Kali Linux";;
-    esac
+    echo ""
+    while true; do
+        read -p "Enter number (1-${TOTAL_DISTROS}) [default: 1]: " PROOT_INPUT
+        PROOT_INPUT=${PROOT_INPUT:-1}
+        if [[ "$PROOT_INPUT" =~ ^[0-9]+$ ]] && \
+           [ "$PROOT_INPUT" -ge 1 ] && \
+           [ "$PROOT_INPUT" -le "$TOTAL_DISTROS" ]; then
+            break
+        fi
+        echo "Please enter a number between 1 and ${TOTAL_DISTROS}."
+    done
 
-    echo -e "\n${GREEN}[+] Installing ${PROOT_LABEL}...${NC}"
+    IDX=$((PROOT_INPUT - 1))
+    PROOT_DISTRO="${DISTRO_ALIASES[$IDX]}"
+    PROOT_LABEL="${DISTRO_NAMES[$IDX]}"
+    PKG_MGR=$(_pkg_mgr_for "$PROOT_DISTRO")
+
+    echo -e "\n${GREEN}[+] Installing ${PROOT_LABEL} (${PROOT_DISTRO})...${NC}"
     (proot-distro install "$PROOT_DISTRO" > /dev/null 2>&1) &
     spinner $! "Downloading ${PROOT_LABEL} rootfs (may take a while)..."
 
+    # Detect actual distro version from /etc/os-release inside the installed rootfs
+    DETECTED_SHELL="bash"
+    case $PKG_MGR in
+        apk|xbps) DETECTED_SHELL="sh" ;;
+    esac
+    DETECTED_LABEL=$(proot-distro login "$PROOT_DISTRO" -- \
+        "$DETECTED_SHELL" -c 'source /etc/os-release 2>/dev/null && echo "$PRETTY_NAME"' 2>/dev/null)
+    if [ -n "$DETECTED_LABEL" ]; then
+        PROOT_LABEL="$DETECTED_LABEL"
+        echo -e "  [*] Detected: ${PROOT_LABEL}"
+    fi
+
     echo -e "  [*] Bootstrapping ${PROOT_LABEL}..."
-    proot-distro login "$PROOT_DISTRO" -- bash -c "
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -y -q 2>/tmp/proot-setup.log || {
-            echo '[!] apt-get update FAILED — GPG keys may be stale'
-            echo '[!] log saved at /tmp/proot-setup.log inside proot'
-        }
-        apt-get install -y -q --no-install-recommends \
-            gnupg ca-certificates software-properties-common 2>/tmp/proot-setup.log || true
-        apt-get install -y -q --reinstall debian-archive-keyring 2>/dev/null || true
-        apt-key adv --keyserver keyserver.ubuntu.com \
-            --recv-keys 3B4FE6ACC0B21F32 871920D1991BC93C 2>/dev/null || true
-        apt-get update -y -q 2>/tmp/proot-setup.log || true
-        apt-get install -y -q --no-install-recommends \
-            mesa-utils vulkan-tools \
-            libgl1-mesa-glx libvulkan1 libgles2-mesa \
-            xfce4 xfce4-terminal dbus-x11 \
-            sudo curl wget git htop nano 2>/tmp/proot-setup.log
-    "
+
+    # ---- Bootstrap: install base packages with the native package manager ----
+    case $PKG_MGR in
+        apt)
+            proot-distro login "$PROOT_DISTRO" -- bash -c "
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update -y -q 2>/tmp/proot-setup.log || {
+                    echo '[!] apt-get update FAILED — GPG keys may be stale'
+                    echo '[!] log saved at /tmp/proot-setup.log inside proot'
+                }
+                apt-get install -y -q --no-install-recommends \
+                    gnupg ca-certificates software-properties-common 2>/tmp/proot-setup.log || true
+                apt-get install -y -q --reinstall debian-archive-keyring 2>/dev/null || true
+                apt-key adv --keyserver keyserver.ubuntu.com \
+                    --recv-keys 3B4FE6ACC0B21F32 871920D1991BC93C 2>/dev/null || true
+                apt-get update -y -q 2>/tmp/proot-setup.log || true
+                apt-get install -y -q --no-install-recommends \
+                    mesa-utils vulkan-tools \
+                    libgl1-mesa-glx libvulkan1 libgles2-mesa \
+                    xfce4 xfce4-terminal dbus-x11 \
+                    sudo curl wget git htop nano 2>/tmp/proot-setup.log
+            "
+            ;;
+        pacman)
+            proot-distro login "$PROOT_DISTRO" -- bash -c "
+                pacman -Sy --noconfirm 2>/tmp/proot-setup.log || true
+                pacman -S --noconfirm --needed \
+                    mesa-utils vulkan-tools mesa \
+                    xfce4 xfce4-terminal dbus \
+                    sudo curl wget git htop nano 2>/tmp/proot-setup.log
+            "
+            ;;
+        dnf)
+            proot-distro login "$PROOT_DISTRO" -- bash -c "
+                dnf check-update -y 2>/tmp/proot-setup.log || true
+                dnf install -y \
+                    mesa-demos vulkan-tools \
+                    mesa-libGL vulkan-loader mesa-libGLES \
+                    @xfce-desktop-environment xfce4-terminal dbus-x11 \
+                    sudo curl wget git htop nano 2>/tmp/proot-setup.log
+            "
+            ;;
+        apk)
+            proot-distro login "$PROOT_DISTRO" -- /bin/sh -c "
+                apk update 2>/tmp/proot-setup.log || true
+                apk add \
+                    mesa-utils vulkan-tools \
+                    mesa-gl vulkan-loader mesa-gles \
+                    xfce4 xfce4-terminal dbus-x11 \
+                    sudo curl wget git htop nano bash 2>/tmp/proot-setup.log
+            "
+            ;;
+        zypper)
+            proot-distro login "$PROOT_DISTRO" -- bash -c "
+                zypper refresh 2>/tmp/proot-setup.log || true
+                zypper install -y \
+                    Mesa-demo-x vulkan-tools \
+                    Mesa-libGL1 libvulkan1 Mesa-libGLESv2-2 \
+                    xfce4 xfce4-terminal dbus-1-x11 \
+                    sudo curl wget git htop nano 2>/tmp/proot-setup.log
+            "
+            ;;
+        xbps)
+            proot-distro login "$PROOT_DISTRO" -- /bin/sh -c "
+                xbps-install -Sy 2>/tmp/proot-setup.log || true
+                xbps-install -y \
+                    mesa-demos vulkan-tools mesa vulkan-loader \
+                    xfce4 xfce4-terminal dbus-x11 \
+                    sudo curl wget git htop nano 2>/tmp/proot-setup.log
+            "
+            ;;
+        *)
+            echo "  [!] Unknown package manager: $PKG_MGR — skipping bootstrap" >&2
+            ;;
+    esac
     echo -e "  [+] Proot bootstrap complete (check /tmp/proot-setup.log inside proot if errors)"
 
-    # If Ubuntu — ensure universe/multiverse keys are valid (common expiry in old rootfs)
+    # ---- GPG key refresh for Ubuntu (common expiry in old rootfs tarballs) ----
     if [ "$PROOT_DISTRO" = "ubuntu" ]; then
         proot-distro login "$PROOT_DISTRO" -- bash -c "
             apt-key adv --keyserver keyserver.ubuntu.com \
@@ -453,9 +586,17 @@ ENVEOF
         # Nice coloured shell prompt
         echo 'export PS1="\[\033[01;32m\]${SETUP_USERNAME}@linux\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "' \
             >> /home/'$SETUP_USERNAME'/.bashrc
-        # Useful aliases
+        # Useful aliases — distro-appropriate update command
         echo 'alias ll="ls -la"' >> /home/'$SETUP_USERNAME'/.bashrc
-        echo 'alias update="sudo apt update && sudo apt upgrade -y"' >> /home/'$SETUP_USERNAME'/.bashrc
+        case "$PKG_MGR" in
+            apt)    echo 'alias update="sudo apt update && sudo apt upgrade -y"' >> /home/'$SETUP_USERNAME'/.bashrc ;;
+            pacman) echo 'alias update="sudo pacman -Syu --noconfirm"' >> /home/'$SETUP_USERNAME'/.bashrc ;;
+            dnf)    echo 'alias update="sudo dnf upgrade -y"' >> /home/'$SETUP_USERNAME'/.bashrc ;;
+            apk)    echo 'alias update="sudo apk update && sudo apk upgrade"' >> /home/'$SETUP_USERNAME'/.bashrc ;;
+            zypper) echo 'alias update="sudo zypper update -y"' >> /home/'$SETUP_USERNAME'/.bashrc ;;
+            xbps)   echo 'alias update="sudo xbps-install -Su"' >> /home/'$SETUP_USERNAME'/.bashrc ;;
+            *)      echo 'alias update="sudo apt update && sudo apt upgrade -y"' >> /home/'$SETUP_USERNAME'/.bashrc ;;
+        esac
     " 2>/dev/null || true
     echo -e "  [+] Proot user '${SETUP_USERNAME}' created with passwordless sudo"
 
@@ -545,7 +686,7 @@ if [ ! -d "$PROOT_ROOTFS" ]; then
     exit 1
 fi
 if [ ! -d "$PROOT_APPS" ]; then
-    echo "[!] No proot apps yet. proot-distro login $PROOT_DISTRO -- apt install <pkg>"
+    echo "[!] No proot apps yet. Install packages inside proot first."
     exit 0
 fi
 
@@ -554,10 +695,32 @@ mkdir -p "$BRIDGE_DIR" "$WRAPPER_DIR"
 HAS_GPU="software"
 [ -d "/dev/dri" ] && HAS_GPU="zink"
 
-# Ensure dbus-x11 in proot
+# Auto-detect package manager inside the proot container
+_PKG_MGR=$("$PROOT_BIN" login "$PROOT_DISTRO" -- bash -c '
+    if command -v apt-get >/dev/null 2>&1; then echo apt;
+    elif command -v pacman >/dev/null 2>&1; then echo pacman;
+    elif command -v dnf >/dev/null 2>&1; then echo dnf;
+    elif command -v apk >/dev/null 2>&1; then echo apk;
+    elif command -v zypper >/dev/null 2>&1; then echo zypper;
+    elif command -v xbps-install >/dev/null 2>&1; then echo xbps;
+    fi' 2>/dev/null)
+
+# Ensure dbus session support in proot
 if ! "$PROOT_BIN" login "$PROOT_DISTRO" -- which dbus-run-session > /dev/null 2>&1; then
-    echo "[*] Installing dbus-x11 in proot..."
-    "$PROOT_BIN" login "$PROOT_DISTRO" -- apt-get install -y -q dbus-x11 > /dev/null 2>&1
+    echo "[*] Installing dbus session support in proot..."
+    case "$_PKG_MGR" in
+        pacman) PKG="dbus" ;;
+        zypper) PKG="dbus-1-x11" ;;
+        *)      PKG="dbus-x11" ;;
+    esac
+    case "$_PKG_MGR" in
+        apt)    "$PROOT_BIN" login "$PROOT_DISTRO" -- apt-get install -y -q "$PKG" > /dev/null 2>&1 ;;
+        pacman) "$PROOT_BIN" login "$PROOT_DISTRO" -- pacman -S --noconfirm "$PKG" > /dev/null 2>&1 ;;
+        dnf)    "$PROOT_BIN" login "$PROOT_DISTRO" -- dnf install -y "$PKG" > /dev/null 2>&1 ;;
+        apk)    "$PROOT_BIN" login "$PROOT_DISTRO" -- apk add "$PKG" > /dev/null 2>&1 ;;
+        zypper) "$PROOT_BIN" login "$PROOT_DISTRO" -- zypper install -y "$PKG" > /dev/null 2>&1 ;;
+        xbps)   "$PROOT_BIN" login "$PROOT_DISTRO" -- xbps-install -y "$PKG" > /dev/null 2>&1 ;;
+    esac
 fi
 
 SYNCED_APPS=()

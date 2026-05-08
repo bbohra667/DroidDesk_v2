@@ -15,6 +15,9 @@ Connect your phone to a monitor and it becomes a Linux PC. Unplug it and your en
 | **GPG Key Refresh** | Proot bootstrap now installs `gnupg` and `ca-certificates` first, reinstalls `debian-archive-keyring`, and fetches current archive signing keys from `keyserver.ubuntu.com` before `apt-get update` | Stale rootfs tarballs have expired GPG keys — `apt-get update` silently fails, leaving the proot container with no packages installed |
 | **Reliable App Menu Sync** | `proot-menu-sync.sh` now force-shows known apps (Chromium, Firefox, VS Code, LibreOffice) even if their `.desktop` file has `NoDisplay=true`; tracks synced/removed app names instead of just counters; clears garcon menu cache so entries appear on next XFCE start | Chromium and other apps were silently skipped by `NoDisplay=true` and never appeared in the XFCE menu |
 | **Fixed Desktop Shortcut Path** | Proot.desktop `Exec=` line now uses `${HOME}/start-proot.sh` instead of the nonexistent `/root/start-proot.sh`; same fix for the first-run theme autostart at `~/.config/autostart/xfce-first-run.desktop` | Termux has no `/root` directory — the shortcut crashed instantly on click |
+| **Dynamic Distribution List** | Setup script queries `proot-distro list` at runtime and presents all 18+ available distributions (Adélie, AlmaLinux, Alpine, Arch, Artix, Chimera, Debian, Deepin, Fedora, Manjaro, OpenSUSE, Oracle, Pardus, Rocky, Trisquel, Ubuntu, Void) grouped by package manager family | The distro list was hardcoded to 3 options with stale version labels. Now it automatically stays in sync with whatever proot-distro supports and always shows the correct version (e.g., "Ubuntu (25.10)" or "Debian (trixie)") |
+| **Multi-Package-Manager Bootstrap** | Each distribution is bootstrapped using its native package manager — `apt`, `pacman`, `dnf`, `apk`, `zypper`, or `xbps` — with the correct package names for GPU drivers, XFCE desktop, and base tools. The user's `.bashrc` `update` alias is also distro-appropriate | Non-Debian distros (Arch, Fedora, Alpine, etc.) now install and bootstrap correctly instead of failing on nonexistent `apt-get` commands |
+| **Debian Repo Setup Hardened** | The Debian Bookworm repo injection for Ubuntu now fails loudly with per-step error messages instead of silently swallowing failures with `2>/dev/null`. Each step (gnupg install, key download, gpg dearmor, apt update) is checked individually, partial state is cleaned up so retry works, and the idempotency guard verifies the keyring is non-empty | On the previous version, if `gnupg` failed to install, the `.sources` file was still written pointing to a nonexistent keyring, and the idempotency guard then blocked any retry — the user had to manually fix it |
 
 ## Video
 
@@ -38,7 +41,7 @@ If it runs on Ubuntu, it runs here.
 
 The Linux environment runs through Termux with direct access to the phone's kernel. No emulation, no translation -- native performance.
 
-The setup script installs a full desktop (XFCE4/LXQt/MATE/KDE) inside Termux using the Termux User Repository (TUR) for GUI apps. For tools not available in TUR (Wireshark, Metasploit, etc.), a Proot container provides a standard Ubuntu/Debian/Kali environment where you install anything with `apt`.
+The setup script installs a full desktop (XFCE4/LXQt/MATE/KDE) inside Termux using the Termux User Repository (TUR) for GUI apps. For tools not available in TUR (Wireshark, Metasploit, etc.), a Proot container provides a standard Linux environment (Ubuntu, Debian, Fedora, Arch, and 14+ other distros) where you install anything with your distro's native package manager.
 
 The automatic menu sync scans what you install inside Proot and adds it directly to your desktop app menu. No need to enter the container every time.
 
@@ -95,7 +98,7 @@ The script will:
 3. Install your chosen desktop environment (XFCE4/LXQt/MATE/KDE)
 4. Set up GPU acceleration (Turnip for Adreno, Zink fallback for others)
 5. Install Firefox, Git, Python, and core tools
-6. Set up a Proot Linux container (Ubuntu/Debian/Kali)
+6. Set up a Proot Linux container (choose from 18+ distros)
 7. Create the App Bridge for automatic menu syncing
 8. Apply a modern dark theme
 9. Optionally set up VNC for remote access
@@ -116,7 +119,13 @@ To install tools that are not in TUR:
 
 ```bash
 bash ~/start-proot.sh
-apt install wireshark    # or any other package
+# Use your distro's package manager:
+#   apt install <pkg>       (Debian/Ubuntu-based)
+#   pacman -S <pkg>         (Arch-based)
+#   dnf install <pkg>       (Fedora/RHEL-based)
+#   apk add <pkg>           (Alpine-based)
+#   zypper install <pkg>    (OpenSUSE)
+#   xbps-install <pkg>      (Void)
 exit
 bash ~/proot-menu-sync.sh
 ```
