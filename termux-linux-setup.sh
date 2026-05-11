@@ -35,6 +35,9 @@ GRAY='\033[0;90m'
 NC='\033[0m'
 BOLD='\033[1m'
 
+# Fix terminal mode for reliable carriage-return / Unicode redraw
+export TERM=xterm-256color
+
 # ============== PROGRESS FUNCTIONS ==============
 update_progress() {
     CURRENT_STEP=$((CURRENT_STEP + 1))
@@ -60,8 +63,9 @@ spinner() {
     local bar_width=12
     local i=0
     local start_time=$SECONDS
-    local cols
-    cols=$(tput cols 2>/dev/null || echo 80)
+
+    # Hide cursor during animation
+    tput civis 2>/dev/null
 
     while kill -0 $pid 2>/dev/null; do
         local elapsed=$((SECONDS - start_time))
@@ -84,9 +88,8 @@ spinner() {
             timestr=$(printf "%ds" $secs)
         fi
 
-        local line
-        printf -v line "  [+] [%s] %s  %s" "$bar" "$message" "$timestr"
-        printf "\r%-${cols}s" "$line"
+        # \033[2K = clear entire line before overwriting
+        printf "\r\033[2K  [+] [%s] %s  %s" "$bar" "$message" "$timestr"
         i=$((i + 1))
         sleep 0.15
     done
@@ -94,7 +97,11 @@ spinner() {
     local exit_code=$?
     local elapsed=$((SECONDS - start_time))
 
-    printf "\r%-${cols}s\r" ""
+    # Restore cursor
+    tput cnorm 2>/dev/null
+
+    # Clear line before final message
+    printf "\r\033[2K"
     if [ $exit_code -eq 0 ]; then
         printf "  [+] %s (done in %ds)\n" "$message" "$elapsed"
     else
@@ -188,7 +195,7 @@ install_pkg() {
         local display
         printf -v display "  [+] [%s] %-20s %8s %9s %s" \
             "$bar" "$tpkg" "$size_str" "$speed_str" "$eta_str"
-        printf "\r%-${cols}s" "$display"
+        printf "\r\033[2K%-${cols}s" "$display"
     done < <(
         DEBIAN_FRONTEND=noninteractive apt-get install -y \
             -o APT::Status-Fd=4 \
@@ -197,7 +204,7 @@ install_pkg() {
         echo "STATUS_DONE:$?"
     )
 
-    printf "\r%-${cols}s\r" ""
+    printf "\r\033[2K"
     if [ "$_exit_code" = "0" ]; then
         echo "  [+] $name installed"
     else
@@ -284,10 +291,10 @@ step_update() {
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Updating system packages...${NC}"
     echo ""
     (DEBIAN_FRONTEND=noninteractive apt-get update -y > /dev/null 2>&1) &
-    spinner $! "Updating package lists..."
+    sp_pid=$!; spinner "$sp_pid" "Updating package lists..."
     (DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -q \
         -o Dpkg::Options::="--force-confold" > /dev/null 2>&1) &
-    spinner $! "Upgrading installed packages..."
+    sp_pid=$!; spinner "$sp_pid" "Upgrading installed packages..."
 }
 
 # ============== STEP 2: REPOSITORIES ==============
@@ -349,7 +356,7 @@ step_gpu() {
     # vulkan-loader is usually pulled in as a mesa dependency; non-fatal if already satisfied
     (DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
         -o Dpkg::Options::="--force-confold" vulkan-loader-android > /dev/null 2>&1) &
-    spinner $! "Installing Vulkan Loader..." || {
+    sp_pid=$!; spinner "$sp_pid" "Installing Vulkan Loader..." || {
         echo -e "  [!] Vulkan Loader skipped (already provided by mesa packages)"
     }
 }
@@ -396,72 +403,58 @@ step_proot() {
     echo ""
     echo -e "${CYAN}Querying available distributions from proot-distro...${NC}"
 
-    # ---- Parse proot-distro list into parallel arrays ----
-    # Primary approach: parse "proot-distro list" output by matching lines
-    # with <alias> patterns. More lenient than requiring the * bullet format.
-    # If that fails, fall back to reading plugin files directly.
-    # Last resort: hardcoded list of all known distros.
+    # ---- Query distro list from proot-distro ----
+    # Extract aliases via <...> (format-stable), then read display names
+    # from plugin files. Falls back to plugin dir scan → hardcoded list.
     DISTRO_NAMES=()
     DISTRO_ALIASES=()
     DISTRO_PKGMGR=()
+    PLUGIN_DIR="/data/data/com.termux/files/usr/share/proot-distro/plugins"
 
-    _parse_distro_line() {
-        # $1 = raw line from proot-distro list (may contain \r, leading *, etc.)
-        local raw="$1"
-        local line name alias pkg
-        line=$(echo "$raw" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-        # Only parse lines starting with * (bullet) and containing <alias>
-        case "$line" in
-            \**"<"*">"*)
-                name=$(echo "$line" | sed 's/[[:space:]]*<.*//' | sed 's/^[[:space:]]*\*[[:space:]]*//;s/[[:space:]]*$//')
-                alias=$(echo "$line" | sed 's/.*<[[:space:]]*//;s/[[:space:]]*>[[:space:]]*$//;s/>.*//')
-                [ -z "$alias" ] && return 1
-                [ "$alias" = "termux" ] && return 1
-                case "$alias" in
-                    ubuntu|debian|deepin|pardus|trisquel|openkylin) pkg="apt" ;;
-                    archlinux|artix|manjaro)                         pkg="pacman" ;;
-                    fedora|almalinux|oracle|rockylinux)              pkg="dnf" ;;
-                    alpine|adelie|chimera)                           pkg="apk" ;;
-                    opensuse)                                        pkg="zypper" ;;
-                    void)                                            pkg="xbps" ;;
-                    *)                                               pkg="unknown" ;;
-                esac
-                DISTRO_NAMES+=("$name")
-                DISTRO_ALIASES+=("$alias")
-                DISTRO_PKGMGR+=("$pkg")
-                ;;
+    _pkgmgr_for() {
+        local a=$1
+        case "$a" in
+            ubuntu|debian|deepin|pardus|trisquel|openkylin) echo "apt" ;;
+            archlinux|artix|manjaro)                         echo "pacman" ;;
+            fedora|almalinux|oracle|rockylinux)              echo "dnf" ;;
+            alpine|adelie|chimera)                           echo "apk" ;;
+            opensuse)                                        echo "zypper" ;;
+            void)                                            echo "xbps" ;;
+            *)                                               echo "unknown" ;;
         esac
     }
 
-    # Attempt 1: parse proot-distro list output
-    while IFS= read -r raw; do
-        _parse_distro_line "$raw"
-    done < <(proot-distro list 2>/dev/null | grep '<')
+    _read_plugin_name() {
+        local alias=$1
+        local plugin="$PLUGIN_DIR/$alias.sh"
+        if [ -f "$plugin" ]; then
+            grep '^DISTRO_NAME=' "$plugin" 2>/dev/null | head -1 | sed 's/^DISTRO_NAME="//;s/"$//'
+        fi
+    }
+
+    # Attempt 1: parse proot-distro list output — extract <alias> with sed
+    while IFS= read -r alias; do
+        [ -z "$alias" ] && continue
+        [ "$alias" = "termux" ] && continue
+        name=$(_read_plugin_name "$alias")
+        [ -z "$name" ] && name="$alias"
+        DISTRO_NAMES+=("$name")
+        DISTRO_ALIASES+=("$alias")
+        DISTRO_PKGMGR+=("$(_pkgmgr_for "$alias")")
+    done < <(proot-distro list 2>/dev/null | grep '<' | sed -E 's/.*< *([^ ]+) *>.*/\1/')
 
     # Attempt 2: if parsing failed, read plugin files directly
-    if [ ${#DISTRO_NAMES[@]} -eq 0 ]; then
-        PLUGIN_DIR="/data/data/com.termux/files/usr/share/proot-distro/plugins"
-        if [ -d "$PLUGIN_DIR" ]; then
-            for plugin in "$PLUGIN_DIR"/*.sh; do
-                [ -f "$plugin" ] || continue
-                local_alias=$(basename "$plugin" .sh)
-                [ "$local_alias" = "termux" ] && continue
-                local_name=$(grep '^DISTRO_NAME=' "$plugin" 2>/dev/null | head -1 | sed 's/^DISTRO_NAME="//;s/"$//')
-                [ -z "$local_name" ] && local_name="$local_alias"
-                case "$local_alias" in
-                    ubuntu|debian|deepin|pardus|trisquel|openkylin) local_pkg="apt" ;;
-                    archlinux|artix|manjaro)                         local_pkg="pacman" ;;
-                    fedora|almalinux|oracle|rockylinux)              local_pkg="dnf" ;;
-                    alpine|adelie|chimera)                           local_pkg="apk" ;;
-                    opensuse)                                        local_pkg="zypper" ;;
-                    void)                                            local_pkg="xbps" ;;
-                    *)                                               local_pkg="unknown" ;;
-                esac
-                DISTRO_NAMES+=("$local_name")
-                DISTRO_ALIASES+=("$local_alias")
-                DISTRO_PKGMGR+=("$local_pkg")
-            done
-        fi
+    if [ ${#DISTRO_NAMES[@]} -eq 0 ] && [ -d "$PLUGIN_DIR" ]; then
+        for plugin in "$PLUGIN_DIR"/*.sh; do
+            [ -f "$plugin" ] || continue
+            alias=$(basename "$plugin" .sh)
+            [ "$alias" = "termux" ] && continue
+            name=$(grep '^DISTRO_NAME=' "$plugin" 2>/dev/null | head -1 | sed 's/^DISTRO_NAME="//;s/"$//')
+            [ -z "$name" ] && name="$alias"
+            DISTRO_NAMES+=("$name")
+            DISTRO_ALIASES+=("$alias")
+            DISTRO_PKGMGR+=("$(_pkgmgr_for "$alias")")
+        done
     fi
 
     # Attempt 3: hardcoded fallback — all distros known to proot-distro (minus termux)
@@ -573,7 +566,7 @@ step_proot() {
 
     echo -e "\n${GREEN}[+] Installing ${PROOT_LABEL} (${PROOT_DISTRO})...${NC}"
     (proot-distro install "$PROOT_DISTRO" > /dev/null 2>&1) &
-    spinner $! "Downloading ${PROOT_LABEL} rootfs (may take a while)..."
+    sp_pid=$!; spinner "$sp_pid" "Downloading ${PROOT_LABEL} rootfs (may take a while)..."
     if [ $? -ne 0 ]; then
         echo -e "  ${RED}[!] Failed to install ${PROOT_DISTRO} rootfs — skipping proot setup${NC}"
         return 1
@@ -834,9 +827,6 @@ BINDS=""
 [ -d "\$TERMUX_TMP/.X11-unix" ] && BINDS="\$BINDS --bind \$TERMUX_TMP/.X11-unix:/tmp/.X11-unix"
 [ -d "/dev/dri" ]               && BINDS="\$BINDS --bind /dev/dri:/dev/dri"
 [ -e "/dev/kgsl-3d0" ]          && BINDS="\$BINDS --bind /dev/kgsl-3d0:/dev/kgsl-3d0"
-[ -d "${TERMUX_VK_ICD}" ]       && BINDS="\$BINDS --bind ${TERMUX_VK_ICD}:/usr/share/vulkan/icd.d.termux"
-[ -f "${TERMUX_LIB}/libvulkan.so" ] && \
-    BINDS="\$BINDS --bind ${TERMUX_LIB}/libvulkan.so:/usr/lib/aarch64-linux-gnu/libvulkan_termux.so"
 
 _RC=\$(mktemp /data/data/com.termux/files/usr/tmp/proot_rc.XXXX)
 cat > "\$_RC" << 'RCEOF'
@@ -844,14 +834,8 @@ export DISPLAY=:0
 export MESA_NO_ERROR=1
 export MESA_GL_VERSION_OVERRIDE=4.6
 export MESA_GLES_VERSION_OVERRIDE=3.2
-export GALLIUM_DRIVER=zink
-export MESA_LOADER_DRIVER_OVERRIDE=zink
-export TU_DEBUG=noconform
-export ZINK_DESCRIPTORS=lazy
-export MESA_VK_WSI_PRESENT_MODE=immediate
-[ -f /usr/share/vulkan/icd.d.termux/freedreno_icd.aarch64.json ] && \
-    export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d.termux/freedreno_icd.aarch64.json
 export XDG_DATA_DIRS=/usr/share:/usr/local/share:\${XDG_DATA_DIRS}
+
 # Sandbox fix for Electron/Chromium apps in proot
 export CHROME_DEVEL_SANDBOX=
 export ELECTRON_NO_SANDBOX=1
@@ -860,7 +844,7 @@ export ELECTRON_DISABLE_SANDBOX=1
 
 export PS1="\[\033[01;32m\]$SETUP_USERNAME@linux\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "
 echo ""
-echo " User: $SETUP_USERNAME | GPU: GALLIUM=\${GALLIUM_DRIVER}"
+echo " User: $SETUP_USERNAME | GPU: (via Termux-X11)"
 echo " Tip: Use /usr/local/bin/<app> for sandbox-free Electron apps"
 echo " Type 'exit' to leave proot."
 echo ""
@@ -1512,7 +1496,7 @@ AREOF
         # -L = follow redirects, --timeout = don't hang forever, -q = silent
         (wget -L -q --timeout=30 --tries=2 \
             -O "$WALLPAPER_FILE" "$WALLPAPER_URL" > /dev/null 2>&1) &
-        spinner $! "Downloading wallpaper (timeout: 30s)..."
+        sp_pid=$!; spinner "$sp_pid" "Downloading wallpaper (timeout: 30s)..."
 
         # Validate: must exist AND be >10KB (not an error HTML page)
         if [ -f "$WALLPAPER_FILE" ] && \
@@ -1531,7 +1515,7 @@ AREOF
             (convert -size 1920x1080 \
                 gradient:"#0f0c29"-"#302b63" \
                 "$WALLPAPER_FILE" > /dev/null 2>&1) &
-            spinner $! "Generating gradient wallpaper..."
+            sp_pid=$!; spinner "$sp_pid" "Generating gradient wallpaper..."
             [ -f "$WALLPAPER_FILE" ] && WALLPAPER_OK=true && \
                 echo -e "  [+] Gradient wallpaper generated"
         fi
