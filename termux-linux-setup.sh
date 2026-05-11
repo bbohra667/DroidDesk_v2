@@ -306,8 +306,8 @@ step_proot() {
     echo -e "${CYAN}Querying available distributions from proot-distro...${NC}"
 
     # ---- Query distro list from proot-distro ----
-    # Extract aliases via <...> (format-stable), then read display names
-    # from plugin files. Falls back to plugin dir scan → hardcoded list.
+    # Primary: scan plugin files (most reliable, doesn't depend on output format)
+    # Fallback: parse proot-distro list → hardcoded list.
     DISTRO_NAMES=()
     DISTRO_ALIASES=()
     DISTRO_PKGMGR=()
@@ -326,37 +326,35 @@ step_proot() {
         esac
     }
 
-    _read_plugin_name() {
-        local alias=$1
-        local plugin="$PLUGIN_DIR/$alias.sh"
-        if [ -f "$plugin" ]; then
-            grep '^DISTRO_NAME=' "$plugin" 2>/dev/null | head -1 | sed 's/^DISTRO_NAME="//;s/"$//'
-        fi
+    _extract_name() {
+        local file=$1
+        grep '^DISTRO_NAME=' "$file" 2>/dev/null | head -1 | sed "s/^DISTRO_NAME=//;s/^[\"']//;s/[\"']$//"
     }
 
-    # Attempt 1: parse proot-distro list output — extract <alias> with sed
-    while IFS= read -r alias; do
-        [ -z "$alias" ] && continue
-        [ "$alias" = "termux" ] && continue
-        name=$(_read_plugin_name "$alias")
-        [ -z "$name" ] && name="$alias"
-        DISTRO_NAMES+=("$name")
-        DISTRO_ALIASES+=("$alias")
-        DISTRO_PKGMGR+=("$(_pkgmgr_for "$alias")")
-    done < <(proot-distro list 2>/dev/null | grep '<' | sed -E 's/.*< *([^ ]+) *>.*/\1/')
-
-    # Attempt 2: if parsing failed, read plugin files directly
-    if [ ${#DISTRO_NAMES[@]} -eq 0 ] && [ -d "$PLUGIN_DIR" ]; then
-        for plugin in "$PLUGIN_DIR"/*.sh; do
+    # Attempt 1: scan plugin directory (doesn't depend on proot-distro list output)
+    if [ -d "$PLUGIN_DIR" ]; then
+        for plugin in "$PLUGIN_DIR"/*; do
             [ -f "$plugin" ] || continue
-            alias=$(basename "$plugin" .sh)
+            alias=$(basename "$plugin")
+            alias="${alias%.sh}"
             [ "$alias" = "termux" ] && continue
-            name=$(grep '^DISTRO_NAME=' "$plugin" 2>/dev/null | head -1 | sed 's/^DISTRO_NAME="//;s/"$//')
+            name=$(_extract_name "$plugin")
             [ -z "$name" ] && name="$alias"
             DISTRO_NAMES+=("$name")
             DISTRO_ALIASES+=("$alias")
             DISTRO_PKGMGR+=("$(_pkgmgr_for "$alias")")
         done
+    fi
+
+    # Attempt 2: if plugin dir failed, try proot-distro list
+    if [ ${#DISTRO_NAMES[@]} -eq 0 ]; then
+        while IFS= read -r alias; do
+            [ -z "$alias" ] && continue
+            [ "$alias" = "termux" ] && continue
+            DISTRO_ALIASES+=("$alias")
+            DISTRO_NAMES+=("$alias")
+            DISTRO_PKGMGR+=("$(_pkgmgr_for "$alias")")
+        done < <(proot-distro list 2>/dev/null | grep '<' | sed -n 's/.*< *\([^ ]*\) *>.*/\1/p')
     fi
 
     # Attempt 3: hardcoded fallback — all distros known to proot-distro (minus termux)
