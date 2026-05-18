@@ -35,6 +35,9 @@ GRAY='\033[0;90m'
 NC='\033[0m'
 BOLD='\033[1m'
 
+# Fix terminal mode for reliable carriage-return / Unicode redraw
+export TERM=xterm-256color
+
 # ============== PROGRESS FUNCTIONS ==============
 update_progress() {
     CURRENT_STEP=$((CURRENT_STEP + 1))
@@ -56,19 +59,26 @@ update_progress() {
 spinner() {
     local pid=$1
     local message=$2
-    local spin='-\|/'
+    local spin_chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
     local i=0
+
+    tput civis 2>/dev/null
+
     while kill -0 $pid 2>/dev/null; do
-        i=$(( (i+1) % 4 ))
-        printf "\r  [*] ${message} ${CYAN}${spin:$i:1}${NC}  "
-        sleep 0.1
+        printf "\r\033[K  [+] %s %s" "${spin_chars:$((i % 9)):1}" "$message"
+        i=$((i + 1))
+        sleep 0.15
     done
     wait $pid
     local exit_code=$?
+
+    tput cnorm 2>/dev/null
+
+    printf "\r\033[K"
     if [ $exit_code -eq 0 ]; then
-        printf "\r  [+] ${message}                    \n"
+        echo "  [+] $message"
     else
-        printf "\r  [-] ${message} ${RED}(failed)${NC}     \n"
+        echo "  [-] $message"
     fi
     return $exit_code
 }
@@ -76,9 +86,33 @@ spinner() {
 install_pkg() {
     local pkg=$1
     local name=${2:-$pkg}
-    (DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        -o Dpkg::Options::="--force-confold" $pkg > /dev/null 2>&1) &
-    spinner $! "Installing ${name}..."
+    local spin_chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    local i=0
+
+    tput civis 2>/dev/null
+
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        -o Dpkg::Options::="--force-confold" $pkg \
+        >/dev/null 2>&1 &
+    local apt_pid=$!
+
+    while kill -0 $apt_pid 2>/dev/null; do
+        printf "\r\033[K  [+] %s %s" "${spin_chars:$((i % 9)):1}" "$name"
+        i=$((i + 1))
+        sleep 0.15
+    done
+    wait $apt_pid
+    local exit_code=$?
+
+    tput cnorm 2>/dev/null
+
+    printf "\r\033[K"
+    if [ $exit_code -eq 0 ]; then
+        echo "  [+] $name installed"
+    else
+        echo "  [-] $name failed"
+    fi
+    return $exit_code
 }
 
 # ============== BANNER ==============
@@ -159,10 +193,10 @@ step_update() {
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Updating system packages...${NC}"
     echo ""
     (DEBIAN_FRONTEND=noninteractive apt-get update -y > /dev/null 2>&1) &
-    spinner $! "Updating package lists..."
+    sp_pid=$!; spinner "$sp_pid" "Updating package lists..."
     (DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -q \
         -o Dpkg::Options::="--force-confold" > /dev/null 2>&1) &
-    spinner $! "Upgrading installed packages..."
+    sp_pid=$!; spinner "$sp_pid" "Upgrading installed packages..."
 }
 
 # ============== STEP 2: REPOSITORIES ==============
@@ -221,7 +255,12 @@ step_gpu() {
     if [ "$GPU_DRIVER" == "freedreno" ]; then
         install_pkg "mesa-vulkan-icd-freedreno" "Turnip Adreno Driver"
     fi
-    install_pkg "vulkan-loader-android" "Vulkan Loader"
+    # vulkan-loader is usually pulled in as a mesa dependency; non-fatal if already satisfied
+    (DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+        -o Dpkg::Options::="--force-confold" vulkan-loader-android > /dev/null 2>&1) &
+    sp_pid=$!; spinner "$sp_pid" "Installing Vulkan Loader..." || {
+        echo -e "  [!] Vulkan Loader skipped (already provided by mesa packages)"
+    }
 }
 
 # ============== STEP 6: AUDIO ==============
@@ -264,38 +303,332 @@ step_proot() {
     install_pkg "proot" "PRoot"
 
     echo ""
-    echo -e "${CYAN}Choose a Linux distro for Proot:${NC}"
-    echo -e "  ${WHITE}1) Ubuntu 22.04 LTS${NC}  (Recommended)"
-    echo -e "  ${WHITE}2) Debian 12${NC}          (Minimal)"
-    echo -e "  ${WHITE}3) Kali Linux${NC}         (Security/Pentesting)"
-    echo ""
-    while true; do
-        read -p "Enter number (1-3) [default: 1]: " PROOT_INPUT
-        PROOT_INPUT=${PROOT_INPUT:-1}
-        if [[ "$PROOT_INPUT" =~ ^[1-3]$ ]]; then break; fi
-        echo "Please enter 1, 2, or 3."
+    echo -e "${CYAN}Querying available distributions from proot-distro...${NC}"
+
+    # ---- Query distro list from proot-distro ----
+    # Primary: scan plugin files (most reliable, doesn't depend on output format)
+    # Fallback: parse proot-distro list → hardcoded list.
+    DISTRO_NAMES=()
+    DISTRO_ALIASES=()
+    DISTRO_PKGMGR=()
+    PLUGIN_DIR="/data/data/com.termux/files/usr/share/proot-distro/plugins"
+
+    _pkgmgr_for() {
+        local a=$1
+        case "$a" in
+            ubuntu|debian|deepin|pardus|trisquel|openkylin) echo "apt" ;;
+            archlinux|artix|manjaro)                         echo "pacman" ;;
+            fedora|almalinux|oracle|rockylinux)              echo "dnf" ;;
+            alpine|adelie|chimera)                           echo "apk" ;;
+            opensuse)                                        echo "zypper" ;;
+            void)                                            echo "xbps" ;;
+            *)                                               echo "unknown" ;;
+        esac
+    }
+
+    _extract_name() {
+        local file=$1
+        grep '^DISTRO_NAME=' "$file" 2>/dev/null | head -1 | sed "s/^DISTRO_NAME=//;s/^[\"']//;s/[\"']$//"
+    }
+
+    # Attempt 1: scan plugin directory (doesn't depend on proot-distro list output)
+    if [ -d "$PLUGIN_DIR" ]; then
+        for plugin in "$PLUGIN_DIR"/*; do
+            [ -f "$plugin" ] || continue
+            alias=$(basename "$plugin")
+            alias="${alias%.sh}"
+            [ "$alias" = "termux" ] && continue
+            name=$(_extract_name "$plugin")
+            [ -z "$name" ] && name="$alias"
+            DISTRO_NAMES+=("$name")
+            DISTRO_ALIASES+=("$alias")
+            DISTRO_PKGMGR+=("$(_pkgmgr_for "$alias")")
+        done
+    fi
+
+    # Attempt 2: if plugin dir failed, try proot-distro list
+    if [ ${#DISTRO_NAMES[@]} -eq 0 ]; then
+        while IFS= read -r alias; do
+            [ -z "$alias" ] && continue
+            [ "$alias" = "termux" ] && continue
+            DISTRO_ALIASES+=("$alias")
+            DISTRO_NAMES+=("$alias")
+            DISTRO_PKGMGR+=("$(_pkgmgr_for "$alias")")
+        done < <(proot-distro list 2>/dev/null | grep '<' | sed -n 's/.*< *\([^ ]*\) *>.*/\1/p')
+    fi
+
+    # Attempt 3: hardcoded fallback — all distros known to proot-distro (minus termux)
+    if [ ${#DISTRO_NAMES[@]} -eq 0 ]; then
+        echo -e "  ${YELLOW}[!] Could not query proot-distro — using built-in list${NC}"
+        DISTRO_NAMES=(
+            "Alpine Linux"      "Adélie Linux"       "Chimera Linux"
+            "Arch Linux"        "Artix Linux"        "Manjaro"
+            "Debian (trixie)"   "Deepin"             "Pardus"
+            "Trisquel GNU/Linux" "Ubuntu (25.10)"
+            "AlmaLinux"         "Fedora"             "Oracle Linux"
+            "Rocky Linux"
+            "OpenSUSE"
+            "Void Linux"
+        )
+        DISTRO_ALIASES=(
+            "alpine"     "adelie"      "chimera"
+            "archlinux"  "artix"       "manjaro"
+            "debian"     "deepin"      "pardus"
+            "trisquel"   "ubuntu"
+            "almalinux"  "fedora"      "oracle"
+            "rockylinux"
+            "opensuse"
+            "void"
+        )
+        DISTRO_PKGMGR=(
+            "apk"    "apk"     "apk"
+            "pacman" "pacman"  "pacman"
+            "apt"    "apt"     "apt"
+            "apt"    "apt"
+            "dnf"    "dnf"     "dnf"
+            "dnf"
+            "zypper"
+            "xbps"
+        )
+    fi
+
+    # Reorder all entries by package manager group so display headers are contiguous
+    _reorder_by_group() {
+        local pkg_order=("apt" "pacman" "dnf" "apk" "zypper" "xbps")
+        local sorted_indices=()
+        for pkg in "${pkg_order[@]}"; do
+            for i in "${!DISTRO_NAMES[@]}"; do
+                if [ "${DISTRO_PKGMGR[$i]}" = "$pkg" ]; then
+                    sorted_indices+=("$i")
+                fi
+            done
+        done
+        local new_names=() new_aliases=() new_pkgmgr=()
+        for idx in "${sorted_indices[@]}"; do
+            new_names+=("${DISTRO_NAMES[$idx]}")
+            new_aliases+=("${DISTRO_ALIASES[$idx]}")
+            new_pkgmgr+=("${DISTRO_PKGMGR[$idx]}")
+        done
+        DISTRO_NAMES=("${new_names[@]}")
+        DISTRO_ALIASES=("${new_aliases[@]}")
+        DISTRO_PKGMGR=("${new_pkgmgr[@]}")
+    }
+    _reorder_by_group
+
+    TOTAL_DISTROS=${#DISTRO_NAMES[@]}
+
+    # Precompute group labels to avoid subshell calls in the display loop
+    DISTRO_GROUPS=()
+    for pkg in "${DISTRO_PKGMGR[@]}"; do
+        case "$pkg" in
+            apt)    DISTRO_GROUPS+=("Debian-based") ;;
+            pacman) DISTRO_GROUPS+=("Arch-based") ;;
+            dnf)    DISTRO_GROUPS+=("RHEL/Fedora-based") ;;
+            apk)    DISTRO_GROUPS+=("Alpine-based") ;;
+            zypper) DISTRO_GROUPS+=("SUSE-based") ;;
+            xbps)   DISTRO_GROUPS+=("Void-based") ;;
+            *)      DISTRO_GROUPS+=("Other") ;;
+        esac
     done
 
-    case $PROOT_INPUT in
-        1) PROOT_DISTRO="ubuntu";         PROOT_LABEL="Ubuntu 22.04";;
-        2) PROOT_DISTRO="debian";         PROOT_LABEL="Debian 12";;
-        3) PROOT_DISTRO="kali-nethunter"; PROOT_LABEL="Kali Linux";;
-    esac
+    echo ""
+    echo -e "${CYAN}Choose a Linux distro for Proot:${NC}"
+    echo ""
 
-    echo -e "\n${GREEN}[+] Installing ${PROOT_LABEL}...${NC}"
+    # Display grouped by package manager
+    CURRENT_GROUP=""
+    for i in "${!DISTRO_NAMES[@]}"; do
+        grp="${DISTRO_GROUPS[$i]}"
+        if [ "$grp" != "$CURRENT_GROUP" ]; then
+            CURRENT_GROUP="$grp"
+            echo -e "  ${WHITE}${grp}:${NC}"
+        fi
+        num=$((i + 1))
+        printf "    ${GREEN}%2d)${NC} %s\n" "$num" "${DISTRO_NAMES[$i]}"
+    done
+
+    echo ""
+    while true; do
+        read -p "Enter number (1-${TOTAL_DISTROS}) [default: 1]: " PROOT_INPUT
+        PROOT_INPUT=${PROOT_INPUT:-1}
+        if [[ "$PROOT_INPUT" =~ ^[0-9]+$ ]] && \
+           [ "$PROOT_INPUT" -ge 1 ] && \
+           [ "$PROOT_INPUT" -le "$TOTAL_DISTROS" ]; then
+            break
+        fi
+        echo "Please enter a number between 1 and ${TOTAL_DISTROS}."
+    done
+
+    IDX=$((PROOT_INPUT - 1))
+    PROOT_DISTRO="${DISTRO_ALIASES[$IDX]}"
+    PROOT_LABEL="${DISTRO_NAMES[$IDX]}"
+    PKG_MGR="${DISTRO_PKGMGR[$IDX]}"
+
+    echo -e "\n${GREEN}[+] Installing ${PROOT_LABEL} (${PROOT_DISTRO})...${NC}"
     (proot-distro install "$PROOT_DISTRO" > /dev/null 2>&1) &
-    spinner $! "Downloading ${PROOT_LABEL} rootfs (may take a while)..."
+    sp_pid=$!; spinner "$sp_pid" "Downloading ${PROOT_LABEL} rootfs (may take a while)..."
+    if [ $? -ne 0 ]; then
+        echo -e "  ${RED}[!] Failed to install ${PROOT_DISTRO} rootfs — skipping proot setup${NC}"
+        return 1
+    fi
+
+    # Detect actual distro version from /etc/os-release inside the installed rootfs
+    DETECTED_SHELL="bash"
+    case $PKG_MGR in
+        apk|xbps) DETECTED_SHELL="sh" ;;
+    esac
+    DETECTED_LABEL=$(proot-distro login "$PROOT_DISTRO" -- \
+        "$DETECTED_SHELL" -c 'source /etc/os-release 2>/dev/null && echo "$PRETTY_NAME"' 2>/dev/null)
+    if [ -n "$DETECTED_LABEL" ]; then
+        PROOT_LABEL="$DETECTED_LABEL"
+        echo -e "  [*] Detected: ${PROOT_LABEL}"
+    fi
 
     echo -e "  [*] Bootstrapping ${PROOT_LABEL}..."
-    proot-distro login "$PROOT_DISTRO" -- bash -c "
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -y -q > /dev/null 2>&1
-        apt-get install -y -q --no-install-recommends \
-            mesa-utils vulkan-tools \
-            libgl1-mesa-glx libvulkan1 libgles2 \
-            xfce4 xfce4-terminal dbus-x11 \
-            sudo curl wget git htop nano > /dev/null 2>&1
-    " 2>/dev/null || true
+
+    # ---- Bootstrap: install base packages with the native package manager ----
+    case $PKG_MGR in
+        apt)
+            proot-distro login "$PROOT_DISTRO" -- bash -c "
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update -y -q 2>/tmp/proot-setup.log || {
+                    echo '[!] apt-get update FAILED — GPG keys may be stale'
+                    echo '[!] log saved at /tmp/proot-setup.log inside proot'
+                }
+                apt-get install -y -q --no-install-recommends \
+                    gnupg ca-certificates software-properties-common 2>/tmp/proot-setup.log || true
+                apt-get install -y -q --reinstall debian-archive-keyring 2>/dev/null || true
+                apt-key adv --keyserver keyserver.ubuntu.com \
+                    --recv-keys 3B4FE6ACC0B21F32 871920D1991BC93C 2>/dev/null || true
+                apt-get update -y -q 2>/tmp/proot-setup.log || true
+                apt-get install -y -q --no-install-recommends \
+                    sudo curl wget git htop nano 2>/tmp/proot-setup.log
+            "
+            ;;
+        pacman)
+            proot-distro login "$PROOT_DISTRO" -- bash -c "
+                pacman -Sy --noconfirm 2>/tmp/proot-setup.log || true
+                pacman -S --noconfirm --needed \
+                    sudo curl wget git htop nano 2>/tmp/proot-setup.log
+            "
+            ;;
+        dnf)
+            proot-distro login "$PROOT_DISTRO" -- bash -c "
+                dnf check-update -y 2>/tmp/proot-setup.log || true
+                dnf install -y \
+                    sudo curl wget git htop nano 2>/tmp/proot-setup.log
+            "
+            ;;
+        apk)
+            proot-distro login "$PROOT_DISTRO" -- /bin/sh -c "
+                apk update 2>/tmp/proot-setup.log || true
+                apk add \
+                    sudo curl wget git htop nano bash 2>/tmp/proot-setup.log
+            "
+            ;;
+        zypper)
+            proot-distro login "$PROOT_DISTRO" -- bash -c "
+                zypper refresh 2>/tmp/proot-setup.log || true
+                zypper install -y \
+                    sudo curl wget git htop nano 2>/tmp/proot-setup.log
+            "
+            ;;
+        xbps)
+            proot-distro login "$PROOT_DISTRO" -- /bin/sh -c "
+                xbps-install -Sy 2>/tmp/proot-setup.log || true
+                xbps-install -y \
+                    sudo curl wget git htop nano 2>/tmp/proot-setup.log
+            "
+            ;;
+        *)
+            echo "  [!] Unknown package manager: $PKG_MGR — skipping bootstrap" >&2
+            ;;
+    esac
+    echo -e "  [+] Proot bootstrap complete (check /tmp/proot-setup.log inside proot if errors)"
+
+    # ---- GPG key refresh for Ubuntu (common expiry in old rootfs tarballs) ----
+    if [ "$PROOT_DISTRO" = "ubuntu" ]; then
+        proot-distro login "$PROOT_DISTRO" -- bash -c "
+            apt-key adv --keyserver keyserver.ubuntu.com \
+                --recv-keys 3B4FE6ACC0B21F32 2>/dev/null || true
+            apt-get update -y -q 2>/dev/null || true
+        " 2>/dev/null
+    fi
+
+    # ---- For Ubuntu proot: add Debian Bookworm repo as default source ----
+    # Ubuntu ships several packages (chromium, firefox, thunderbird) as snap-only
+    # transitional packages that silently fail inside proot (no systemd/snapd).
+    # Debian still ships them as proper .deb packages — use Debian as the primary
+    # source and pin Ubuntu low, so apt install <anything> gets a working binary.
+    # Uses deb822 (.sources) format with Signed-By for reliable GPG keyring
+    # instead of deprecated apt-key.
+    if [ "$PROOT_DISTRO" = "ubuntu" ]; then
+        proot-distro login "$PROOT_DISTRO" -- bash -c '
+            # Skip if already configured AND keyring is valid
+            if [ -f /etc/apt/sources.list.d/debian.sources ] && \
+               [ -s /usr/share/keyrings/debian-archive-keyring.gpg ]; then
+                exit 0
+            fi
+
+            # Clean up any partial state from a previous failed attempt
+            rm -f /etc/apt/sources.list.d/debian*
+            rm -f /etc/apt/preferences.d/debian-bookworm
+
+            # Install gnupg — fail hard if this does not work
+            apt-get install -y -q gnupg ca-certificates curl || {
+                echo "  [!] Failed to install gnupg/ca-certificates/curl" >&2
+                exit 1
+            }
+
+            # Download and install the official Debian 12 archive keyring
+            mkdir -p /usr/share/keyrings
+            if ! curl -fsSL https://ftp-master.debian.org/keys/archive-key-12.asc \
+                -o /tmp/debian12.asc; then
+                echo "  [!] Failed to download Debian 12 archive key" >&2
+                exit 1
+            fi
+            if ! gpg --dearmor -o /usr/share/keyrings/debian-archive-keyring.gpg \
+                /tmp/debian12.asc; then
+                echo "  [!] Failed to dearmor Debian 12 archive key" >&2
+                rm -f /tmp/debian12.asc
+                exit 1
+            fi
+            rm -f /tmp/debian12.asc
+
+            # Verify the keyring file is non-empty
+            if [ ! -s /usr/share/keyrings/debian-archive-keyring.gpg ]; then
+                echo "  [!] Debian keyring is empty after dearmor" >&2
+                exit 1
+            fi
+
+            # Write modern deb822-format sources entry with Signed-By
+            printf "%s\n" \
+                "Types: deb" \
+                "URIs: http://deb.debian.org/debian" \
+                "Suites: bookworm" \
+                "Components: main" \
+                "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg" \
+                > /etc/apt/sources.list.d/debian.sources
+
+            # Pin Debian at normal priority (500). Pin Ubuntu low so Debian wins
+            # on any package that exists in both repos. This avoids snapd deps.
+            printf "%s\n" \
+                "Package: *" \
+                "Pin: release o=Debian" \
+                "Pin-Priority: 500" \
+                "" \
+                "Package: *" \
+                "Pin: release o=Ubuntu" \
+                "Pin-Priority: 99" \
+                > /etc/apt/preferences.d/debian-bookworm
+
+            apt-get update -y -q || {
+                echo "  [!] apt-get update failed after adding Debian repo" >&2
+                exit 1
+            }
+            echo "  [+] Debian Bookworm repo added as default (avoids snap-only Ubuntu packages)"
+        '
+    fi
 
     # ---- Global --no-sandbox wrapper for Electron/Chromium apps in proot ----
     proot-distro login "$PROOT_DISTRO" -- bash -c "
@@ -359,9 +692,17 @@ ENVEOF
         # Nice coloured shell prompt
         echo 'export PS1="\[\033[01;32m\]${SETUP_USERNAME}@linux\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "' \
             >> /home/'$SETUP_USERNAME'/.bashrc
-        # Useful aliases
+        # Useful aliases — distro-appropriate update command
         echo 'alias ll="ls -la"' >> /home/'$SETUP_USERNAME'/.bashrc
-        echo 'alias update="sudo apt update && sudo apt upgrade -y"' >> /home/'$SETUP_USERNAME'/.bashrc
+        case "$PKG_MGR" in
+            apt)    echo 'alias update="sudo apt update && sudo apt upgrade -y"' >> /home/'$SETUP_USERNAME'/.bashrc ;;
+            pacman) echo 'alias update="sudo pacman -Syu --noconfirm"' >> /home/'$SETUP_USERNAME'/.bashrc ;;
+            dnf)    echo 'alias update="sudo dnf upgrade -y"' >> /home/'$SETUP_USERNAME'/.bashrc ;;
+            apk)    echo 'alias update="sudo apk update && sudo apk upgrade"' >> /home/'$SETUP_USERNAME'/.bashrc ;;
+            zypper) echo 'alias update="sudo zypper update -y"' >> /home/'$SETUP_USERNAME'/.bashrc ;;
+            xbps)   echo 'alias update="sudo xbps-install -Su"' >> /home/'$SETUP_USERNAME'/.bashrc ;;
+            *)      echo 'alias update="sudo apt update && sudo apt upgrade -y"' >> /home/'$SETUP_USERNAME'/.bashrc ;;
+        esac
     " 2>/dev/null || true
     echo -e "  [+] Proot user '${SETUP_USERNAME}' created with passwordless sudo"
 
@@ -386,9 +727,6 @@ BINDS=""
 [ -d "\$TERMUX_TMP/.X11-unix" ] && BINDS="\$BINDS --bind \$TERMUX_TMP/.X11-unix:/tmp/.X11-unix"
 [ -d "/dev/dri" ]               && BINDS="\$BINDS --bind /dev/dri:/dev/dri"
 [ -e "/dev/kgsl-3d0" ]          && BINDS="\$BINDS --bind /dev/kgsl-3d0:/dev/kgsl-3d0"
-[ -d "${TERMUX_VK_ICD}" ]       && BINDS="\$BINDS --bind ${TERMUX_VK_ICD}:/usr/share/vulkan/icd.d.termux"
-[ -f "${TERMUX_LIB}/libvulkan.so" ] && \
-    BINDS="\$BINDS --bind ${TERMUX_LIB}/libvulkan.so:/usr/lib/aarch64-linux-gnu/libvulkan_termux.so"
 
 _RC=\$(mktemp /data/data/com.termux/files/usr/tmp/proot_rc.XXXX)
 cat > "\$_RC" << 'RCEOF'
@@ -396,14 +734,8 @@ export DISPLAY=:0
 export MESA_NO_ERROR=1
 export MESA_GL_VERSION_OVERRIDE=4.6
 export MESA_GLES_VERSION_OVERRIDE=3.2
-export GALLIUM_DRIVER=zink
-export MESA_LOADER_DRIVER_OVERRIDE=zink
-export TU_DEBUG=noconform
-export ZINK_DESCRIPTORS=lazy
-export MESA_VK_WSI_PRESENT_MODE=immediate
-[ -f /usr/share/vulkan/icd.d.termux/freedreno_icd.aarch64.json ] && \
-    export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d.termux/freedreno_icd.aarch64.json
 export XDG_DATA_DIRS=/usr/share:/usr/local/share:\${XDG_DATA_DIRS}
+
 # Sandbox fix for Electron/Chromium apps in proot
 export CHROME_DEVEL_SANDBOX=
 export ELECTRON_NO_SANDBOX=1
@@ -412,7 +744,7 @@ export ELECTRON_DISABLE_SANDBOX=1
 
 export PS1="\[\033[01;32m\]$SETUP_USERNAME@linux\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "
 echo ""
-echo " User: $SETUP_USERNAME | GPU: GALLIUM=\${GALLIUM_DRIVER}"
+echo " User: $SETUP_USERNAME | GPU: (via Termux-X11)"
 echo " Tip: Use /usr/local/bin/<app> for sandbox-free Electron apps"
 echo " Type 'exit' to leave proot."
 echo ""
@@ -434,9 +766,25 @@ PROOTEOF
 #         Blender libvulkan auto-detect, LibreOffice --norestore
 # ============================================================
 
-PROOT_DISTRO="${1:-ubuntu}"
+PROOT_DISTRO="${1:-}"
+PROOT_ROOT="/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs"
+
+# Auto-detect installed proot distro if no argument given
+if [ -z "$PROOT_DISTRO" ]; then
+    for d in "$PROOT_ROOT"/*; do
+        [ -d "$d" ] || continue
+        PROOT_DISTRO=$(basename "$d")
+        break
+    done
+    if [ -z "$PROOT_DISTRO" ]; then
+        echo "[!] No proot distro found. Run the setup script first."
+        exit 1
+    fi
+    echo "[*] Auto-detected proot distro: $PROOT_DISTRO"
+fi
+
 PROOT_BIN="/data/data/com.termux/files/usr/bin/proot-distro"
-PROOT_ROOTFS="/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs/$PROOT_DISTRO"
+PROOT_ROOTFS="$PROOT_ROOT/$PROOT_DISTRO"
 PROOT_APPS="$PROOT_ROOTFS/usr/share/applications"
 BRIDGE_DIR="$HOME/.local/share/applications/proot-bridge"
 WRAPPER_DIR="$HOME/.local/share/proot-wrappers"
@@ -451,7 +799,7 @@ if [ ! -d "$PROOT_ROOTFS" ]; then
     exit 1
 fi
 if [ ! -d "$PROOT_APPS" ]; then
-    echo "[!] No proot apps yet. proot-distro login $PROOT_DISTRO -- apt install <pkg>"
+    echo "[!] No proot apps yet. Install packages inside proot first."
     exit 0
 fi
 
@@ -460,21 +808,45 @@ mkdir -p "$BRIDGE_DIR" "$WRAPPER_DIR"
 HAS_GPU="software"
 [ -d "/dev/dri" ] && HAS_GPU="zink"
 
-# Ensure dbus-x11 in proot
+# Auto-detect package manager inside the proot container (use /bin/sh since
+# some distros don't ship bash by default; we install it during bootstrap)
+_PKG_MGR=$("$PROOT_BIN" login "$PROOT_DISTRO" -- /bin/sh -c '
+    if command -v apt-get >/dev/null 2>&1; then echo apt;
+    elif command -v pacman >/dev/null 2>&1; then echo pacman;
+    elif command -v dnf >/dev/null 2>&1; then echo dnf;
+    elif command -v apk >/dev/null 2>&1; then echo apk;
+    elif command -v zypper >/dev/null 2>&1; then echo zypper;
+    elif command -v xbps-install >/dev/null 2>&1; then echo xbps;
+    fi' 2>/dev/null)
+
+# Ensure dbus session support in proot
 if ! "$PROOT_BIN" login "$PROOT_DISTRO" -- which dbus-run-session > /dev/null 2>&1; then
-    echo "[*] Installing dbus-x11 in proot..."
-    "$PROOT_BIN" login "$PROOT_DISTRO" -- apt-get install -y -q dbus-x11 > /dev/null 2>&1
+    echo "[*] Installing dbus session support in proot..."
+    case "$_PKG_MGR" in
+        pacman) PKG="dbus" ;;
+        zypper) PKG="dbus-1-x11" ;;
+        *)      PKG="dbus-x11" ;;
+    esac
+    case "$_PKG_MGR" in
+        apt)    "$PROOT_BIN" login "$PROOT_DISTRO" -- apt-get install -y -q "$PKG" > /dev/null 2>&1 ;;
+        pacman) "$PROOT_BIN" login "$PROOT_DISTRO" -- pacman -S --noconfirm "$PKG" > /dev/null 2>&1 ;;
+        dnf)    "$PROOT_BIN" login "$PROOT_DISTRO" -- dnf install -y "$PKG" > /dev/null 2>&1 ;;
+        apk)    "$PROOT_BIN" login "$PROOT_DISTRO" -- apk add "$PKG" > /dev/null 2>&1 ;;
+        zypper) "$PROOT_BIN" login "$PROOT_DISTRO" -- zypper install -y "$PKG" > /dev/null 2>&1 ;;
+        xbps)   "$PROOT_BIN" login "$PROOT_DISTRO" -- xbps-install -y "$PKG" > /dev/null 2>&1 ;;
+    esac
 fi
 
-SYNCED=0
-REMOVED=0
+SYNCED_APPS=()
+REMOVED_APPS=()
 
 for bridge_file in "$BRIDGE_DIR"/proot-*.desktop; do
     [ -f "$bridge_file" ] || continue
     original_name=$(basename "$bridge_file" | sed 's/^proot-//')
     if [ ! -f "$PROOT_APPS/$original_name" ]; then
+        DISPLAY_NAME=$(grep "^Name=" "$bridge_file" | head -1 | sed 's/^Name=\[P\] //; s/^Name=//')
         rm -f "$bridge_file" "$WRAPPER_DIR/proot-${original_name%.desktop}.sh"
-        REMOVED=$((REMOVED + 1))
+        REMOVED_APPS+=("${DISPLAY_NAME:-${original_name%.desktop}}")
     fi
 done
 
@@ -486,8 +858,13 @@ for desktop_file in "$PROOT_APPS"/*.desktop; do
     output="$BRIDGE_DIR/proot-$filename"
     wrapper="$WRAPPER_DIR/proot-${appname}.sh"
 
-    grep -q "^NoDisplay=true" "$desktop_file" 2>/dev/null && continue
-    grep -q "^Hidden=true"    "$desktop_file" 2>/dev/null && continue
+    # Skip truly hidden entries, but force-show known user-facing apps
+    if echo "$appname" | grep -qiE "chromium|chromium-browser|firefox|firefox-esr|code|vscode|code-insiders|libreoffice|gimp|vlc"; then
+        : # force-show — skip NoDisplay check
+    elif grep -q "^NoDisplay=true" "$desktop_file" 2>/dev/null; then
+        continue
+    fi
+    grep -q "^Hidden=true" "$desktop_file" 2>/dev/null && continue
 
     ORIGINAL_EXEC=$(grep "^Exec=" "$desktop_file" | head -1 | sed 's/^Exec=//')
     [ -z "$ORIGINAL_EXEC" ] && continue
@@ -562,12 +939,35 @@ WRAPEOF
 
     APP_NAME=$(grep "^Name=" "$output" | head -1 | sed 's/^Name=//')
     [[ "$APP_NAME" != \[P\]* ]] && sed -i "s|^Name=.*|Name=[P] $APP_NAME|" "$output"
-    SYNCED=$((SYNCED + 1))
+    SYNCED_APPS+=("${APP_NAME}")
 done
 
-echo "[+] Bridge: $SYNCED synced, $REMOVED removed."
+echo ""
+echo "============================================="
+echo "  Proot Menu Bridge Sync Complete"
+echo "============================================="
+if [ ${#SYNCED_APPS[@]} -gt 0 ]; then
+    echo "  Synced (${#SYNCED_APPS[@]} apps):"
+    for app in "${SYNCED_APPS[@]}"; do
+        echo "    [+] $app"
+    done
+else
+    echo "  No apps synced"
+fi
+if [ ${#REMOVED_APPS[@]} -gt 0 ]; then
+    echo "  Removed (${#REMOVED_APPS[@]} apps):"
+    for app in "${REMOVED_APPS[@]}"; do
+        echo "    [-] $app"
+    done
+fi
+echo ""
 echo "    Logs: \$TERMUX_TMP/proot-<appname>.log"
 echo "    Re-run after new installs: bash ~/proot-menu-sync.sh"
+
+# Force menu cache rebuild so garcon picks up bridge entries on next XFCE start
+rm -f "$HOME/.cache/menus/"* 2>/dev/null
+echo "    Menu cache cleared — apps will appear on next XFCE restart"
+echo ""
 
 pgrep -x "xfce4-panel" > /dev/null 2>&1 && xfce4-panel --restart > /dev/null 2>&1 &
 pgrep -x "xfdesktop"   > /dev/null 2>&1 && { sleep 1; xfdesktop --reload > /dev/null 2>&1 & }
@@ -577,6 +977,121 @@ SYNCEOF
 
     # Run once during install
     bash ~/proot-menu-sync.sh "$PROOT_DISTRO" 2>/dev/null || true
+
+    # ---- proot-gpu-setup.sh (for installing GPU drivers inside the proot container) ----
+    cat > ~/proot-gpu-setup.sh << 'GPUEOF'
+#!/data/data/com.termux/files/usr/bin/bash
+# ============================================================
+#  Proot GPU Setup
+#  Installs Mesa + Vulkan drivers inside the proot container.
+#  Auto-detects GPU type (freedreno/Adreno vs zink/others)
+#  and the container's package manager.
+# ============================================================
+
+PROOT_DISTRO="${1:-}"
+PROOT_ROOT="/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs"
+
+# Auto-detect installed proot distro if no argument given
+if [ -z "$PROOT_DISTRO" ]; then
+    for d in "$PROOT_ROOT"/*; do
+        [ -d "$d" ] || continue
+        PROOT_DISTRO=$(basename "$d")
+        break
+    done
+    if [ -z "$PROOT_DISTRO" ]; then
+        echo "[!] No proot distro found. Install one with proot-distro first."
+        exit 1
+    fi
+    echo "[*] Auto-detected proot distro: $PROOT_DISTRO"
+fi
+
+PROOT_BIN="/data/data/com.termux/files/usr/bin/proot-distro"
+PROOT_ROOTFS="$PROOT_ROOT/$PROOT_DISTRO"
+
+if [ ! -d "$PROOT_ROOTFS" ]; then
+    echo "[!] Proot distro '$PROOT_DISTRO' not installed."
+    exit 1
+fi
+
+# Detect GPU type: freedreno for Adreno, zink for everything else
+GPU_TYPE="zink"
+if [ -e "/sys/class/kgsl/kgsl-3d0" ] || \
+   ls /sys/devices/platform/*.gpu 2>/dev/null | grep -q . || \
+   (command -v getprop >/dev/null 2>&1 && getprop ro.hardware 2>/dev/null | grep -qi "qcom\|adreno"); then
+    GPU_TYPE="freedreno"
+fi
+
+# Detect package manager inside proot
+_PKG_MGR=$("$PROOT_BIN" login "$PROOT_DISTRO" -- /bin/sh -c '
+    if command -v apt-get >/dev/null 2>&1; then echo apt;
+    elif command -v pacman >/dev/null 2>&1; then echo pacman;
+    elif command -v dnf >/dev/null 2>&1; then echo dnf;
+    elif command -v apk >/dev/null 2>&1; then echo apk;
+    elif command -v zypper >/dev/null 2>&1; then echo zypper;
+    elif command -v xbps-install >/dev/null 2>&1; then echo xbps;
+    fi' 2>/dev/null)
+
+if [ -z "$_PKG_MGR" ]; then
+    echo "[!] Could not detect package manager inside proot."
+    exit 1
+fi
+
+echo "[*] Detected GPU: $GPU_TYPE"
+echo "[*] Package manager: $_PKG_MGR"
+
+case "$_PKG_MGR" in
+    apt)
+        "$PROOT_BIN" login "$PROOT_DISTRO" -- bash -c "
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -y -q 2>/dev/null || true
+            apt-get install -y -q --no-install-recommends \
+                mesa mesa-vulkan-drivers vulkan-loader 2>/tmp/proot-gpu.log
+        "
+        ;;
+    pacman)
+        "$PROOT_BIN" login "$PROOT_DISTRO" -- bash -c "
+            pacman -Sy --noconfirm 2>/dev/null || true
+            pacman -S --noconfirm --needed \
+                mesa vulkan-icd-loader 2>/tmp/proot-gpu.log
+        "
+        ;;
+    dnf)
+        "$PROOT_BIN" login "$PROOT_DISTRO" -- bash -c "
+            dnf check-update -y 2>/dev/null || true
+            dnf install -y \
+                mesa mesa-vulkan-drivers vulkan-loader 2>/tmp/proot-gpu.log
+        "
+        ;;
+    apk)
+        "$PROOT_BIN" login "$PROOT_DISTRO" -- /bin/sh -c "
+            apk update 2>/dev/null || true
+            apk add mesa mesa-vulkan-icd-freedreno vulkan-loader 2>/tmp/proot-gpu.log
+        "
+        ;;
+    zypper)
+        "$PROOT_BIN" login "$PROOT_DISTRO" -- bash -c "
+            zypper refresh 2>/dev/null || true
+            zypper install -y Mesa Mesa-vulkan-drivers libvulkan1 2>/tmp/proot-gpu.log
+        "
+        ;;
+    xbps)
+        "$PROOT_BIN" login "$PROOT_DISTRO" -- /bin/sh -c "
+            xbps-install -Sy 2>/dev/null || true
+            xbps-install -y mesa mesa-vulkan-icd-freedreno vulkan-loader 2>/tmp/proot-gpu.log
+        "
+        ;;
+esac
+
+if [ $? -eq 0 ]; then
+    echo "[+] GPU drivers installed successfully in proot ($GPU_TYPE via $_PKG_MGR)"
+    echo "    Check /tmp/proot-gpu.log inside proot for details"
+else
+    echo "[-] GPU driver install exited with errors (see /tmp/proot-gpu.log)"
+fi
+GPUEOF
+    chmod +x ~/proot-gpu-setup.sh
+    echo -e "  [+] Created ~/proot-gpu-setup.sh"
+    bash ~/proot-gpu-setup.sh "$PROOT_DISTRO" 2>/dev/null || true
 }
 
 # ============== STEP 10: LAUNCHERS ==============
@@ -661,7 +1176,7 @@ sleep 3
 export DISPLAY=:0
 
 # Sync proot apps into menu (background, non-blocking)
-[ -f ~/proot-menu-sync.sh ] && bash ~/proot-menu-sync.sh > /dev/null 2>&1 &
+[ -f ~/proot-menu-sync.sh ] && bash ~/proot-menu-sync.sh "$PROOT_DISTRO" &
 
 echo "----------------------------------------------"
 echo "  [*] Open the Termux-X11 app to see desktop"
@@ -866,7 +1381,7 @@ FREOF
 [Desktop Entry]
 Type=Application
 Name=XFCE First Run Setup
-Exec=bash /root/.config/xfce-first-run.sh
+Exec=bash ${HOME}/.config/xfce-first-run.sh
 Hidden=false
 NoDisplay=true
 X-GNOME-Autostart-enabled=true
@@ -881,7 +1396,7 @@ AREOF
         # -L = follow redirects, --timeout = don't hang forever, -q = silent
         (wget -L -q --timeout=30 --tries=2 \
             -O "$WALLPAPER_FILE" "$WALLPAPER_URL" > /dev/null 2>&1) &
-        spinner $! "Downloading wallpaper (timeout: 30s)..."
+        sp_pid=$!; spinner "$sp_pid" "Downloading wallpaper (timeout: 30s)..."
 
         # Validate: must exist AND be >10KB (not an error HTML page)
         if [ -f "$WALLPAPER_FILE" ] && \
@@ -900,7 +1415,7 @@ AREOF
             (convert -size 1920x1080 \
                 gradient:"#0f0c29"-"#302b63" \
                 "$WALLPAPER_FILE" > /dev/null 2>&1) &
-            spinner $! "Generating gradient wallpaper..."
+            sp_pid=$!; spinner "$sp_pid" "Generating gradient wallpaper..."
             [ -f "$WALLPAPER_FILE" ] && WALLPAPER_OK=true && \
                 echo -e "  [+] Gradient wallpaper generated"
         fi
@@ -955,7 +1470,7 @@ EOF
 [Desktop Entry]
 Name=Linux Container
 Comment=Open Proot Shell with GPU support
-Exec=${term_cmd} -e "bash /root/start-proot.sh"
+Exec=${term_cmd} -e "bash ${HOME}/start-proot.sh"
 Icon=system-run
 Type=Application
 Terminal=false

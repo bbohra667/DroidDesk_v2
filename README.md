@@ -11,6 +11,18 @@ Connect your phone to a monitor and it becomes a Linux PC. Unplug it and your en
 | **Proot Sandbox Fix** | Global `--no-sandbox` wrapper script installed inside proot at `/usr/local/bin/proot-sandbox-fix`, plus symlinks for `code`, `chromium`, `brave`, `discord`, `slack`, `teams`, and other Electron/Chromium apps | Proot lacks user namespaces, so Electron/Chromium sandbox crashes with `--no-sandbox` error — the fix auto-appends `--no-sandbox --disable-gpu-sandbox` to all affected binaries |
 | **App Bridge Sandbox Detection** | `proot-menu-sync.sh` auto-detects Electron/Chromium apps by name and injects `--no-sandbox` flags and sandbox-disabling env vars into the desktop launcher wrappers | Ensures apps launched from the XFCE menu (not just terminal) also bypass the sandbox correctly |
 | **Environment Variable Protection** | Proot shell rcfile exports `ELECTRON_NO_SANDBOX=1`, `ELECTRON_DISABLE_SANDBOX=1`, and `CHROME_DEVEL_SANDBOX=` globally; `/etc/proot-sandbox/env.sh` sources on login | Catches any Electron app that respects env vars instead of CLI flags, even if it's not in the name-based detection list |
+| **Debian Repo for Ubuntu Proot** | When Ubuntu is selected, Debian Bookworm's repo is added as the default package source (priority 500) and Ubuntu's own packages are pinned low (priority 99). This means `apt install` prefers Debian packages when they exist in both repos. | Ubuntu ships `chromium`, `firefox`, `thunderbird`, and other packages as snap-only transitional deps that silently fail in proot (no systemd/snapd). Debian still ships them as proper `.deb` packages that work normally. |
+| **GPG Key Refresh** | Proot bootstrap now installs `gnupg` and `ca-certificates` first, reinstalls `debian-archive-keyring`, and fetches current archive signing keys from `keyserver.ubuntu.com` before `apt-get update` | Stale rootfs tarballs have expired GPG keys — `apt-get update` silently fails, leaving the proot container with no packages installed |
+| **Reliable App Menu Sync** | `proot-menu-sync.sh` now force-shows known apps (Chromium, Firefox, VS Code, LibreOffice) even if their `.desktop` file has `NoDisplay=true`; tracks synced/removed app names instead of just counters; clears garcon menu cache so entries appear on next XFCE start | Chromium and other apps were silently skipped by `NoDisplay=true` and never appeared in the XFCE menu |
+| **Fixed Desktop Shortcut Path** | Proot.desktop `Exec=` line now uses `${HOME}/start-proot.sh` instead of the nonexistent `/root/start-proot.sh`; same fix for the first-run theme autostart at `~/.config/autostart/xfce-first-run.desktop` | Termux has no `/root` directory — the shortcut crashed instantly on click |
+| **Dynamic Distribution List** | Setup script queries `proot-distro list` at runtime and presents all 18+ available distributions (Adélie, AlmaLinux, Alpine, Arch, Artix, Chimera, Debian, Deepin, Fedora, Manjaro, OpenSUSE, Oracle, Pardus, Rocky, Trisquel, Ubuntu, Void) grouped by package manager family | The distro list was hardcoded to 3 options with stale version labels. Now it automatically stays in sync with whatever proot-distro supports and always shows the correct version (e.g., "Ubuntu (25.10)" or "Debian (trixie)") |
+| **Multi-Package-Manager Bootstrap** | Each distribution is bootstrapped using its native package manager — `apt`, `pacman`, `dnf`, `apk`, `zypper`, or `xbps` — with the correct package names for base tools (`sudo`, `curl`, `wget`, `git`, `htop`, `nano`). The user's `.bashrc` `update` alias is also distro-appropriate. XFCE, Mesa, dbus, and vulkan-tools are no longer installed inside proot since the desktop runs natively in Termux | Non-Debian distros (Arch, Fedora, Alpine, etc.) now install and bootstrap correctly instead of failing on nonexistent `apt-get` commands. Removing redundant desktop/GPU packages saves ~150 MB per install and avoids pulling a second DE that is never used |
+| **Debian Repo Setup Hardened** | The Debian Bookworm repo injection for Ubuntu now fails loudly with per-step error messages instead of silently swallowing failures with `2>/dev/null`. Each step (gnupg install, key download, gpg dearmor, apt update) is checked individually, partial state is cleaned up so retry works, and the idempotency guard verifies the keyring is non-empty | On the previous version, if `gnupg` failed to install, the `.sources` file was still written pointing to a nonexistent keyring, and the idempotency guard then blocked any retry — the user had to manually fix it |
+| **Robust Distro List Parsing** | Three-tier fallback: (1) parse `proot-distro list` output matching only bullet lines starting with `*` (skips the header line), (2) read plugin files directly from the plugins directory, (3) built-in list of all 17 known distros. Carriage returns and terminal quirks are stripped. After collection, entries are sorted by package manager priority so all Debian-based, Arch-based, etc. appear under contiguous group headers without repetition | On some Termux setups the old `sed` filter failed to match `proot-distro list` output, silently falling back to a tiny hardcoded list. The header line `Supported distributions (format: name < alias >):` also matched the `<` pattern, producing garbage entries — now both are fixed |
+| **Real Apt Progress Bar** | Install progress shows actual apt download stats: `[███████⠦░░░░░] mesa-1:26.0.6-1...  11.7 MiB  658 KiB/s  00:18` on a single dynamically-updating line. Parses apt's Status-Fd (`dlstatus`/`pmstatus` lines) for real byte counts, speeds, and ETAs. Bar width reduced to 12 | The old spinner showed a fake time-based counter unrelated to actual download progress, and the 20-wide bar felt oversized |
+| **proot-menu-sync.sh Auto-Detection** | When run without an argument, `proot-menu-sync.sh` now scans `/data/data/.../installed-rootfs/` and auto-detects which proot distro is installed instead of defaulting to `ubuntu`. `start-x11.sh` also passes the distro name explicitly during desktop launch | Running `proot-menu-sync.sh` on a non-Ubuntu distro (e.g., Arch) used to fail with "Proot distro 'ubuntu' not installed" — now it works regardless of which distro was chosen |
+| **Stripped Redundant Proot Packages** | XFCE, all Mesa/GPU packages, vulkan-tools, and dbus have been removed from the proot bootstrap. Each section now installs only the base tooling (`sudo curl wget git htop nano`). The desktop runs entirely in Termux-native via Termux-X11, so no second DE is needed inside the container. GPU/rendering libraries are pulled automatically when a user runs `apt install blender` (or similar) inside proot | Proot bootstrap previously installed a full XFCE desktop + Mesa stack (~150 MB) that was never used — the Termux-native DE provides both the display server and desktop environment. Cutting these packages reduces bootstrap time significantly |
+| **Proot GPU Setup Script** | A new standalone script `~/proot-gpu-setup.sh` auto-detects the installed proot distro, GPU type (freedreno for Adreno, zink fallback), and package manager inside the container, then installs the correct Mesa + Vulkan driver packages. Runs automatically after proot bootstrap and can be re-run anytime with `bash ~/proot-gpu-setup.sh` | Users who need GPU acceleration inside proot (e.g., Blender, Vulkan apps) can now install it on-demand instead of having it forced during bootstrap. The script handles all six package managers automatically |
 
 ## Video
 
@@ -34,7 +46,7 @@ If it runs on Ubuntu, it runs here.
 
 The Linux environment runs through Termux with direct access to the phone's kernel. No emulation, no translation -- native performance.
 
-The setup script installs a full desktop (XFCE4/LXQt/MATE/KDE) inside Termux using the Termux User Repository (TUR) for GUI apps. For tools not available in TUR (Wireshark, Metasploit, etc.), a Proot container provides a standard Ubuntu/Debian/Kali environment where you install anything with `apt`.
+The setup script installs a full desktop (XFCE4/LXQt/MATE/KDE) inside Termux using the Termux User Repository (TUR) for GUI apps. For tools not available in TUR (Wireshark, Metasploit, etc.), a Proot container provides a standard Linux environment (Ubuntu, Debian, Fedora, Arch, and 14+ other distros) where you install anything with your distro's native package manager.
 
 The automatic menu sync scans what you install inside Proot and adds it directly to your desktop app menu. No need to enter the container every time.
 
@@ -91,7 +103,7 @@ The script will:
 3. Install your chosen desktop environment (XFCE4/LXQt/MATE/KDE)
 4. Set up GPU acceleration (Turnip for Adreno, Zink fallback for others)
 5. Install Firefox, Git, Python, and core tools
-6. Set up a Proot Linux container (Ubuntu/Debian/Kali)
+6. Set up a Proot Linux container (choose from 18+ distros)
 7. Create the App Bridge for automatic menu syncing
 8. Apply a modern dark theme
 9. Optionally set up VNC for remote access
@@ -112,7 +124,13 @@ To install tools that are not in TUR:
 
 ```bash
 bash ~/start-proot.sh
-apt install wireshark    # or any other package
+# Use your distro's package manager:
+#   apt install <pkg>       (Debian/Ubuntu-based)
+#   pacman -S <pkg>         (Arch-based)
+#   dnf install <pkg>       (Fedora/RHEL-based)
+#   apk add <pkg>           (Alpine-based)
+#   zypper install <pkg>    (OpenSUSE)
+#   xbps-install <pkg>      (Void)
 exit
 bash ~/proot-menu-sync.sh
 ```
